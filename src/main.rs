@@ -8,6 +8,7 @@ mod agent;
 mod daemon;
 mod events;
 mod history;
+mod tool_output;
 
 use tracing::info;
 

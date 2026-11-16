@@ -6,7 +6,7 @@
 //! that are sent as `SessionNotification` messages before the
 //! `LoadSessionResponse`.
 //!
-//! # Daemon history item shapes (from `polytoken openapi`)
+//! # Daemon history item shapes (from `polytoken print openapi`)
 //!
 //! All items share `HistoryItemMeta` fields (`projected_index`, `item_id`)
 //! plus a `type` discriminant. The translatable variants are:
@@ -42,7 +42,8 @@ pub fn translate_history_item(item: &serde_json::Value) -> Vec<acp::SessionUpdat
         "user" => translate_user_item(item),
         "assistant" => translate_assistant_item(item),
         "tool_result" => translate_tool_result_item(item),
-        "facet_switch" => translate_facet_switch_item(item),
+        // Facets are not ACP permission modes.
+        "facet_switch" => Vec::new(),
         // Internal/unknown types — skip gracefully
         _ => Vec::new(),
     };
@@ -62,7 +63,11 @@ pub fn translate_history_item(item: &serde_json::Value) -> Vec<acp::SessionUpdat
 /// has been summarized or discarded from the LLM's active context. Replaying
 /// pre-boundary items to the client would "munge" multiple separate conversation
 /// contexts into one continuous timeline.
-const CONTEXT_BOUNDARY_TYPES: &[&str] = &["context_cleared", "compaction_fencepost"];
+const CONTEXT_BOUNDARY_TYPES: &[&str] = &[
+    "context_cleared",
+    "compaction_fencepost",
+    "native_compaction_boundary_v1",
+];
 
 /// Find the index of the *last* context boundary in the items slice.
 ///
@@ -192,8 +197,13 @@ fn translate_assistant_item(item: &serde_json::Value) -> Vec<acp::SessionUpdate>
                 }
                 updates.push(acp::SessionUpdate::ToolCall(tool_call));
             }
-            "thinking" => {
-                let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            "thinking" | "open_ai_reasoning_opaque" => {
+                let key = if block_type == "thinking" {
+                    "text"
+                } else {
+                    "summary"
+                };
+                let text = block.get(key).and_then(|v| v.as_str()).unwrap_or("");
                 if !text.is_empty() {
                     let content_block: acp::ContentBlock = text.to_string().into();
                     let chunk = acp::ContentChunk::new(content_block);
@@ -237,54 +247,17 @@ fn translate_tool_result_item(item: &serde_json::Value) -> Vec<acp::SessionUpdat
 
     let mut fields = acp::ToolCallUpdateFields::new().status(status);
 
-    // Extract text content from the ToolResultContent
-    let content = item.get("content");
+    // Prefer the saved live display, including structured full results and diffs.
+    let content = item
+        .get("live_display")
+        .filter(|v| !v.is_null())
+        .or_else(|| item.get("content").filter(|v| !v.is_null()));
     if let Some(content) = content {
-        // Shape 1: { text: String }
-        if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
-            // Try to parse as JSON for raw_output
-            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text) {
-                fields = fields.raw_output(json_val);
-            }
-            let block: acp::ContentBlock = text.to_string().into();
-            fields = fields.content(vec![acp::ToolCallContent::from(block)]);
-        }
-        // Shape 2: { blocks: [ContentBlock] }
-        else if let Some(blocks) = content.get("blocks").and_then(|v| v.as_array()) {
-            let mut tool_contents = Vec::new();
-            let mut raw_parts: Vec<serde_json::Value> = Vec::new();
-            for block in blocks {
-                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                    let cb: acp::ContentBlock = text.to_string().into();
-                    tool_contents.push(acp::ToolCallContent::from(cb));
-                    raw_parts.push(serde_json::Value::String(text.to_string()));
-                }
-            }
-            if !tool_contents.is_empty() {
-                fields = fields.content(tool_contents);
-            }
-            if raw_parts.len() == 1 {
-                fields = fields.raw_output(raw_parts.into_iter().next().unwrap());
-            } else if raw_parts.len() > 1 {
-                fields = fields.raw_output(serde_json::Value::Array(raw_parts));
-            }
-        }
+        fields = crate::tool_output::fields(content, status);
     }
 
     let update = acp::ToolCallUpdate::new(call_id.to_string(), fields);
     vec![acp::SessionUpdate::ToolCallUpdate(update)]
-}
-
-/// `facet_switch` → `CurrentModeUpdate`
-///
-/// Daemon shape: `{ from_facet: String, to_facet: String, ... }`
-fn translate_facet_switch_item(item: &serde_json::Value) -> Vec<acp::SessionUpdate> {
-    let to_facet = item.get("to_facet").and_then(|v| v.as_str()).unwrap_or("");
-    if to_facet.is_empty() {
-        return Vec::new();
-    }
-    let mode_update = acp::CurrentModeUpdate::new(to_facet.to_string());
-    vec![acp::SessionUpdate::CurrentModeUpdate(mode_update)]
 }
 
 // ---------------------------------------------------------------------------
@@ -410,13 +383,10 @@ mod tests {
             "emitted_at": "2026-07-14T20:05:00Z",
         });
         let updates = translate_history_item(&item);
-        assert_eq!(updates.len(), 1);
-        match &updates[0] {
-            acp::SessionUpdate::CurrentModeUpdate(mode) => {
-                assert_eq!(mode.current_mode_id, "execute".into());
-            }
-            other => panic!("Expected CurrentModeUpdate, got {other:?}"),
-        }
+        assert!(
+            updates.is_empty(),
+            "facet switches must not change the permission mode"
+        );
     }
 
     #[test]

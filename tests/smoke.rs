@@ -195,6 +195,7 @@ async fn test_initialize_capabilities() {
     let caps = result
         .get("agentCapabilities")
         .expect("missing agentCapabilities");
+    assert_eq!(caps["mcpCapabilities"]["http"], true);
     assert_eq!(caps["loadSession"], true, "loadSession should be true");
 
     // Session capabilities: must advertise list and resume

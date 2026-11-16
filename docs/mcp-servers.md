@@ -60,9 +60,9 @@ Each ACP session gets its own temp config directory (random suffix) and its own 
 When a session is closed or the ACP connection is dropped (stdin EOF), `polytoken-acp` calls `terminate()` on the daemon handle, which cleans up:
 
 - **MCP config directory** (`$TMPDIR/polytoken-acp-mcp-<random>/`) — may contain auth tokens.
-- **Daemon temp directory** (`$TMPDIR/polytoken-acp-<session_id>/`) — contains the credential file (bearer token) and logs.
+- **Daemon temp directory** (`$TMPDIR/polytoken-acp-<random>/`) — contains the credential file (bearer token) and logs.
 
-The daemon's persistent sessions directory (`~/.local/share/polytoken/sessions/`) is **not** cleaned up, so session history survives for `--resume`.
+The daemon's persistent sessions directory (`~/.local/share/polytoken/sessions-acp-v1/` (0.9.8; legacy base `sessions-acp/`)) is **not** cleaned up, so session history survives for `--resume`.
 
 ## Transport mapping
 

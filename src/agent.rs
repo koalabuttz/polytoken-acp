@@ -11,8 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{
-    Agent, Client, ConnectionTo, Dispatch, Stdio, on_receive_dispatch, on_receive_notification,
-    on_receive_request,
+    Agent, Client, ConnectionTo, Stdio, on_receive_notification, on_receive_request,
 };
 use anyhow::{Context, bail};
 use tracing::{debug, error, info, warn};
@@ -209,7 +208,7 @@ pub async fn run() {
                     let caps = acp::AgentCapabilities::new()
                         .load_session(true)
                         .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
-                        .mcp_capabilities(acp::McpCapabilities::new())
+                        .mcp_capabilities(acp::McpCapabilities::new().http(true))
                         .session_capabilities(
                             acp::SessionCapabilities::new()
                                 .list(acp::SessionListCapabilities::new())
@@ -326,16 +325,9 @@ pub async fn run() {
             },
             on_receive_notification!(),
         )
-        // Fallback: respond to any unhandled message with an error
-        .on_receive_dispatch(
-            async move |message: Dispatch, cx| {
-                message.respond_with_error(
-                    agent_client_protocol::util::internal_error("unhandled message"),
-                    cx,
-                )
-            },
-            on_receive_dispatch!(),
-        )
+        // The SDK rejects unknown requests and routes client responses to their
+        // awaiting handlers. A catch-all dispatch handler would also intercept
+        // successful permission and extension responses and replace them with errors.
         .connect_to(Stdio::new())
         .await;
 
@@ -1333,7 +1325,7 @@ fn discover_facets(cwd: &std::path::Path) -> Vec<String> {
     facets.into_keys().collect()
 }
 
-/// Build the ACP available commands list from `polytoken print-slash-commands`.
+/// Build the ACP available commands list from `polytoken print slash-commands`.
 ///
 /// Only commands that the daemon can actually execute when received as a
 /// prompt are advertised. TUI-only commands (help, refresh, quit, theme,
@@ -1357,12 +1349,12 @@ fn build_available_commands(cwd: &std::path::Path) -> Option<Vec<acp::AvailableC
     ];
 
     let output = std::process::Command::new("polytoken")
-        .arg("print-slash-commands")
+        .args(["print", "slash-commands", "--format", "json"])
         .output()
         .ok()?;
 
     if !output.status.success() {
-        warn!(status = ?output.status, "polytoken print-slash-commands failed");
+        warn!(status = ?output.status, "polytoken print slash-commands failed");
         return None;
     }
 
@@ -1551,8 +1543,8 @@ fn build_model_config_option(
 /// - `available_models[]`: each has a `reasoning` field describing effort levels
 ///
 /// We find the active model in `available_models`, extract its reasoning levels,
-/// and build a select config option. When Paseo sets a thought_level, we translate
-/// it to a model switch: `zai/glm-5.2(high)` instead of `zai/glm-5.2`.
+/// and build a select config option. Thought-level changes use the daemon's
+/// explicit `reasoning_effort` field on `POST /model`.
 fn build_thought_level_config_option(
     state: &Result<serde_json::Value, anyhow::Error>,
 ) -> Option<acp::SessionConfigOption> {
@@ -1582,7 +1574,7 @@ fn build_thought_level_config_option(
     // Extract effort levels from the reasoning capability.
     // Two shapes: {"type": "effort", "levels": [...], "default_level": "..."}
     //          or {"type": "thinking", "can_disable": true} (thinking on/off)
-    let (levels, default_level) =
+    let (mut levels, default_level) =
         if reasoning.get("type").and_then(|v| v.as_str()) == Some("effort") {
             let levels = reasoning
                 .get("levels")
@@ -1599,7 +1591,11 @@ fn build_thought_level_config_option(
             // Thinking models have two states: on (default) and off (none).
             // We map them as "thinking" and "none".
             (
-                vec!["thinking".to_string(), "none".to_string()],
+                if reasoning.get("can_disable").and_then(|v| v.as_bool()) == Some(true) {
+                    vec!["thinking".to_string(), "none".to_string()]
+                } else {
+                    return None;
+                },
                 Some("thinking".to_string()),
             )
         } else {
@@ -1609,6 +1605,11 @@ fn build_thought_level_config_option(
 
     if levels.is_empty() {
         return None;
+    }
+    if reasoning.get("can_disable").and_then(|v| v.as_bool()) == Some(true)
+        && !levels.iter().any(|level| level == "none")
+    {
+        levels.push("none".to_string());
     }
 
     // The current thought_level is from active_reasoning_effort, or the default.
@@ -1634,6 +1635,24 @@ fn build_thought_level_config_option(
         acp::SessionConfigOption::select("thought_level", "Thinking", current, options)
             .category(acp::SessionConfigOptionCategory::ThoughtLevel),
     )
+}
+
+/// Use the explicit reasoning field; model selector suffixes are unnecessary.
+fn build_reasoning_request(state: &serde_json::Value, value: &str) -> Option<serde_json::Value> {
+    let option = build_thought_level_config_option(&Ok(state.clone()))?;
+    let option_json = serde_json::to_value(option).ok()?;
+    if !option_json
+        .get("options")?
+        .as_array()?
+        .iter()
+        .any(|o| o["value"] == value)
+    {
+        return None;
+    }
+    let model = state.get("active_model")?.as_str()?.split('(').next()?;
+    // "t" is the daemon's thinking-on label.
+    let effort = if value == "thinking" { "t" } else { value };
+    Some(serde_json::json!({"model": model, "reasoning_effort": effort}))
 }
 
 /// Build MCP server config options from the daemon's `/state` response.
@@ -2055,82 +2074,22 @@ async fn handle_set_session_config_option(
                 .send()
                 .await;
 
-            let model_with_effort = match state_resp {
-                Ok(r) if r.status().is_success() => {
-                    let state: serde_json::Value = match r.json().await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!(error = %e, "Failed to parse /state for thought_level");
-                            return responder.respond_with_error(
-                                agent_client_protocol::Error::internal_error().data(
-                                    serde_json::json!({"error": "Failed to read daemon state for thought_level"}),
-                                ),
-                            );
-                        }
-                    };
-                    let active_model = state
-                        .get("active_model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-
-                    if active_model.is_empty() {
-                        warn!("Cannot set thought_level: no active model");
-                        return responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]));
-                    }
-
-                    // The daemon encodes effort in the model name (e.g.
-                    // "zai/glm-5.2(high)"). When a variant is already active,
-                    // /state's active_model already includes the suffix, so
-                    // strip any existing "(…)" suffix before composing the new
-                    // variant to avoid doubling it (e.g.
-                    // "zai/glm-5.2(high)(medium)").
-                    let base_model = active_model.split('(').next().unwrap_or(active_model);
-
-                    // For effort-type models: append (value) to model name
-                    // For thinking-type models: "thinking" → use base model name (no suffix)
-                    //                          "none" → append (none)
-                    let model_with_effort = if value == "thinking" {
-                        // Thinking on = the base model name (default)
-                        base_model.to_string()
-                    } else {
-                        format!("{}({})", base_model, value)
-                    };
-
-                    // Verify this model variant exists in available_models
-                    let available = state
-                        .get("available_models")
-                        .and_then(|v| v.as_array())
-                        .cloned()
-                        .unwrap_or_default();
-
-                    let exists = available.iter().any(|m| {
-                        m.get("name").and_then(|v| v.as_str()) == Some(&model_with_effort)
-                    });
-
-                    if !exists {
-                        warn!(
-                            model = %model_with_effort,
-                            "Model variant not found in available_models; trying anyway"
-                        );
-                    }
-
-                    model_with_effort
-                }
-                _ => {
-                    error!("Failed to fetch /state for thought_level");
-                    return responder.respond_with_error(
-                        agent_client_protocol::Error::internal_error().data(
-                            serde_json::json!({"error": "Failed to fetch daemon state for thought_level"}),
-                        ),
-                    );
-                }
+            let daemon_state = match state_resp {
+                Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+                _ => None,
             };
-
-            (
-                format!("{}/model", base_url),
-                serde_json::json!({ "model": model_with_effort }),
-                "thought_level",
-            )
+            let payload = match daemon_state
+                .as_ref()
+                .and_then(|state| build_reasoning_request(state, &value))
+            {
+                Some(payload) => payload,
+                None => return responder.respond_with_error(
+                    agent_client_protocol::Error::invalid_params().data(
+                        serde_json::json!({"error": "Unsupported reasoning effort for the active model"}),
+                    ),
+                ),
+            };
+            (format!("{}/model", base_url), payload, "thought_level")
         }
         _ => {
             warn!(config_id = %config_id, "Unsupported config option; ignoring");
@@ -2285,7 +2244,9 @@ impl SseConsumer {
                         return responder
                             .take()
                             .expect("responder already consumed")
-                            .respond(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                            .respond_with_error(agent_client_protocol::Error::internal_error().data(
+                                serde_json::json!({"error": "Daemon event stream failed after reconnect attempts"}),
+                            ));
                     }
                     warn!(
                         prompt_id = %prompt_id,
@@ -2310,6 +2271,15 @@ impl SseConsumer {
                     }
                 }
                 ConsumeOutcome::Continue => {}
+                ConsumeOutcome::Fatal(message) => {
+                    return responder
+                        .take()
+                        .expect("responder already consumed")
+                        .respond_with_error(
+                            agent_client_protocol::Error::internal_error()
+                                .data(serde_json::json!({"error": message})),
+                        );
+                }
             }
         }
     }
@@ -2319,6 +2289,7 @@ enum ConsumeOutcome {
     Continue,
     Done(acp::StopReason),
     Error,
+    Fatal(String),
 }
 
 /// Connect to SSE stream and consume events until the turn ends or an error occurs.
@@ -2388,6 +2359,7 @@ async fn connect_and_consume(
             {
                 ConsumeOutcome::Done(reason) => return ConsumeOutcome::Done(reason),
                 ConsumeOutcome::Error => return ConsumeOutcome::Error,
+                ConsumeOutcome::Fatal(message) => return ConsumeOutcome::Fatal(message),
                 ConsumeOutcome::Continue => {}
             }
         }
@@ -2395,7 +2367,7 @@ async fn connect_and_consume(
 
     // Stream ended without message_complete
     warn!(prompt_id = %prompt_id, "SSE stream ended without explicit turn end");
-    ConsumeOutcome::Done(acp::StopReason::EndTurn)
+    ConsumeOutcome::Error
 }
 
 /// Process a single SSE event and translate it into ACP actions.
@@ -2437,6 +2409,18 @@ async fn process_sse_event(
     }
 
     match events::translate_event(&event) {
+        EventTranslation::Error(message) => ConsumeOutcome::Fatal(message),
+        EventTranslation::ConfigStateChange => {
+            let options = rebuild_config_options(base_url, bearer_token).await;
+            let notification = acp::SessionNotification::new(
+                acp::SessionId::new(session_id.to_string()),
+                acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(options)),
+            );
+            if let Err(e) = conn.send_notification(notification) {
+                warn!(error = %e, "Failed to send config_option_update");
+            }
+            ConsumeOutcome::Continue
+        }
         EventTranslation::Update(update) => {
             let update_name = events::session_update_name(&update);
             tracing::debug!(
@@ -4014,6 +3998,27 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_request_uses_explicit_effort_and_validates_capabilities() {
+        let mut state = serde_json::json!({"active_model":"provider/model(high)",
+            "active_reasoning_effort":"high", "available_models":[{"name":"provider/model",
+            "reasoning":{"type":"effort","levels":["low","high"],"can_disable":true}}]});
+        assert_eq!(
+            build_reasoning_request(&state, "low"),
+            Some(serde_json::json!({"model":"provider/model","reasoning_effort":"low"}))
+        );
+        assert!(build_reasoning_request(&state, "ultra").is_none());
+        assert!(build_reasoning_request(&state, "none").is_some());
+        state["available_models"][0]["reasoning"] =
+            serde_json::json!({"type":"thinking","can_disable":false});
+        assert!(build_thought_level_config_option(&Ok(state.clone())).is_none());
+        state["available_models"][0]["reasoning"]["can_disable"] = serde_json::json!(true);
+        assert_eq!(
+            build_reasoning_request(&state, "thinking").unwrap()["reasoning_effort"],
+            "t"
+        );
+    }
 
     #[test]
     fn test_parse_plan_handoff_answer_selected() {

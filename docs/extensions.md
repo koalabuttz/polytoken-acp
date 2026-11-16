@@ -22,7 +22,7 @@ All extension methods use the `_polytoken/` vendor namespace.
 
 ### 1. `_polytoken/ask_user_question` (Extension Request)
 
-Sent when the Polytoken daemon emits an `ask_user_question` interrogative event. This is a **request** — it expects a response containing the user's answers. See the [Polytool CLI reference](https://docs.polytoken.dev/reference/cli/) for `polytoken event-schema`, which prints the full `DaemonEvent` JSON Schema including interrogative shapes.
+Sent when the Polytoken daemon emits an `ask_user_question` interrogative event. This is a **request** — it expects a response containing the user's answers. See the [Polytool CLI reference](https://docs.polytoken.dev/reference/cli/) for `polytoken print event-schema`, which prints the full `DaemonEvent` JSON Schema including interrogative shapes.
 
 **When:** The daemon agent calls `ask_user_question` (structured questions with options, modes, etc.). This cannot be mapped to ACP's standard `session/request_permission`, so it uses an extension request instead.
 
@@ -259,7 +259,7 @@ Permissions are **not** a config option — they are a session mode (see above).
 ### Polytoken
 
 - [Introduction](https://docs.polytoken.dev/introduction) — what Polytoken is and how the daemon works
-- [CLI Reference](https://docs.polytoken.dev/reference/cli/) — `polytoken event-schema` prints the full `DaemonEvent` JSON Schema; `polytoken print-tools` prints tool documentation
+- [CLI Reference](https://docs.polytoken.dev/reference/cli/) — `polytoken print event-schema` prints the full `DaemonEvent` JSON Schema; `polytoken print tools` prints tool documentation
 - [Daemon Authentication](https://docs.polytoken.dev/reference/daemon-auth) — bearer token and HTTP daemon API
 - [Application Configuration](https://docs.polytoken.dev/reference/configuration/) — provider config, permission rules, MCP block lists
 

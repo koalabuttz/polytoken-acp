@@ -85,7 +85,7 @@ pub enum DaemonEvent {
         #[serde(default)]
         content: Option<String>,
         #[serde(default)]
-        content_full: Option<String>,
+        content_full: Option<serde_json::Value>,
         #[serde(default)]
         is_error: Option<bool>,
     },
@@ -113,11 +113,28 @@ pub enum DaemonEvent {
         payload: AskUserQuestionPayload,
     },
     #[serde(rename = "model_changed")]
-    ModelChanged { model: String },
+    #[serde(alias = "model_switch")]
+    ModelChanged {
+        #[serde(alias = "to_model")]
+        model: String,
+    },
+    #[serde(rename = "model_options_changed", alias = "daemon_catalog_changed")]
+    ConfigChanged,
+    #[serde(rename = "harness_error")]
+    HarnessError {
+        prompt_id: String,
+        reason: serde_json::Value,
+    },
+    #[serde(rename = "stream_discontinuity")]
+    StreamDiscontinuity { missed: u64 },
     #[serde(rename = "session_title_changed")]
     SessionTitleChanged { title: String },
     #[serde(rename = "facet_changed")]
-    FacetChanged { facet: String },
+    #[serde(alias = "facet_switch")]
+    FacetChanged {
+        #[serde(alias = "to_facet")]
+        facet: String,
+    },
     #[serde(rename = "subagent_started")]
     SubagentStarted {
         handle: String,
@@ -241,6 +258,8 @@ pub enum BlockDeltaPayload {
     RedactedThinking { data: String },
     #[serde(rename = "open_ai_reasoning_opaque")]
     OpenAiReasoning { id: String, data: String },
+    #[serde(rename = "open_ai_reasoning_summary")]
+    OpenAiReasoningSummary { text: String },
     #[serde(other)]
     Other,
 }
@@ -374,6 +393,10 @@ pub enum EventTranslation {
     TurnEnd,
     /// The turn was cancelled.
     TurnCancelled,
+    /// The daemon could not finish or the live stream lost data.
+    Error(String),
+    /// Re-fetch model and reasoning options.
+    ConfigStateChange,
     /// A permission request from the daemon that needs an ACP round-trip.
     PermissionRequest {
         interrogative_id: String,
@@ -482,6 +505,9 @@ pub fn event_type_name(evt: &DaemonEvent) -> &'static str {
         DaemonEvent::UsageThrottle { .. } => "usage_throttle",
         DaemonEvent::Heartbeat => "heartbeat",
         DaemonEvent::PermissionMonitorSwitch { .. } => "permission_monitor_switch",
+        DaemonEvent::ConfigChanged => "config_changed",
+        DaemonEvent::HarnessError { .. } => "harness_error",
+        DaemonEvent::StreamDiscontinuity { .. } => "stream_discontinuity",
         DaemonEvent::Other => "unknown",
     }
 }
@@ -521,6 +547,9 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
                 }
                 BlockDeltaPayload::OpenAiReasoning { id, data } => {
                     format!("openai_reasoning id={} len={}", id, data.len())
+                }
+                BlockDeltaPayload::OpenAiReasoningSummary { text } => {
+                    format!("reasoning_summary len={}", text.len())
                 }
                 BlockDeltaPayload::Other => "other_delta".to_string(),
             };
@@ -566,7 +595,8 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
             is_error,
             ..
         } => {
-            let content_desc = if let Some(c) = content_full.as_ref().or(content.as_ref()) {
+            let full_text = content_full.as_ref().and_then(crate::tool_output::text);
+            let content_desc = if let Some(c) = full_text.as_ref().or(content.as_ref()) {
                 let preview: String = c.chars().take(120).collect();
                 format!(" content={}", preview)
             } else {
@@ -606,6 +636,9 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
                 payload.questions.len()
             )
         }
+        DaemonEvent::ConfigChanged => String::new(),
+        DaemonEvent::HarnessError { reason, .. } => reason.to_string(),
+        DaemonEvent::StreamDiscontinuity { missed } => format!("missed={missed}"),
         DaemonEvent::ModelChanged { model } => format!("model={}", model),
         DaemonEvent::SessionTitleChanged { title } => format!("title={}", title),
         DaemonEvent::FacetChanged { facet } => format!("facet={}", facet),
@@ -723,6 +756,7 @@ pub fn event_prompt_id(evt: &DaemonEvent) -> Option<&str> {
         | DaemonEvent::MessageComplete { prompt_id }
         | DaemonEvent::TurnCancelled { prompt_id }
         | DaemonEvent::ModelError { prompt_id }
+        | DaemonEvent::HarnessError { prompt_id, .. }
         | DaemonEvent::ToolCall { prompt_id, .. }
         | DaemonEvent::ToolResult { prompt_id, .. }
         | DaemonEvent::Interrogative { prompt_id, .. }
@@ -773,7 +807,7 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
 
         // OpenAI reasoning → AgentThoughtChunk
         DaemonEvent::ContentBlockDelta {
-            delta: BlockDeltaPayload::OpenAiReasoning { data, .. },
+            delta: BlockDeltaPayload::OpenAiReasoningSummary { text: data },
             ..
         } => {
             let content_block: acp::ContentBlock = data.clone().into();
@@ -828,17 +862,13 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             } else {
                 acp::ToolCallStatus::Completed
             };
-            let mut fields = acp::ToolCallUpdateFields::new().status(status);
-            // Prefer content_full over content for the tool call output
-            let effective_content = content_full.as_ref().or(content.as_ref());
-            if let Some(c) = effective_content {
-                // Try to parse content as JSON for raw_output
-                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(c) {
-                    fields = fields.raw_output(json_val);
-                }
-                let block: acp::ContentBlock = c.clone().into();
-                fields = fields.content(vec![acp::ToolCallContent::from(block)]);
-            }
+            let legacy_content = content
+                .as_ref()
+                .map(|s| serde_json::Value::String(s.clone()));
+            let fields = match content_full.as_ref().or(legacy_content.as_ref()) {
+                Some(value) => crate::tool_output::fields(value, status),
+                None => acp::ToolCallUpdateFields::new().status(status),
+            };
             let update = acp::ToolCallUpdate::new(call_id.clone(), fields);
             EventTranslation::Update(acp::SessionUpdate::ToolCallUpdate(update))
         }
@@ -930,13 +960,15 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
         }
 
         // Model changed → send config_option_update so client refreshes model picker
-        DaemonEvent::ModelChanged { model } => {
-            debug!(model = %model, "Model changed; forwarding as session_info_update");
-            // We can't build a full config_option_update here without the full list,
-            // so we send a session_info_update with the model in _meta for clients
-            // that want it. The model config option is already set from /state.
-            EventTranslation::Ignore
+        DaemonEvent::ModelChanged { .. } | DaemonEvent::ConfigChanged => {
+            EventTranslation::ConfigStateChange
         }
+        DaemonEvent::HarnessError { reason, .. } => {
+            EventTranslation::Error(format!("Daemon harness error: {reason}"))
+        }
+        DaemonEvent::StreamDiscontinuity { missed } => EventTranslation::Error(format!(
+            "Daemon event stream lost {missed} events; reload the session"
+        )),
 
         // Session title changed → forward as session_info_update
         DaemonEvent::SessionTitleChanged { title } => {
@@ -1561,6 +1593,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn current_event_contracts() {
+        let result = parse_sse_event(r#"{"seq":1,"event":{"type":"tool_result","prompt_id":"p","call_id":"c","content":"short","content_full":{"text":"full result"},"is_error":false}}"#).unwrap();
+        let EventTranslation::Update(acp::SessionUpdate::ToolCallUpdate(update)) =
+            translate_event(&result)
+        else {
+            panic!("missing structured result")
+        };
+        let json = serde_json::to_value(update).unwrap();
+        assert_eq!(json["rawOutput"]["text"], "full result");
+        for event in [
+            r#"{"type":"model_switch","from_model":"a","to_model":"b"}"#,
+            r#"{"type":"model_options_changed","action":"reset","selection":{}}"#,
+            r#"{"type":"daemon_catalog_changed","daemon_epoch":"e","catalog_revision":"2","domains":[]}"#,
+        ] {
+            assert!(matches!(
+                translate_event(&parse_sse_event(event).unwrap()),
+                EventTranslation::ConfigStateChange
+            ));
+        }
+        let facet =
+            parse_sse_event(r#"{"type":"facet_switch","from_facet":"plan","to_facet":"execute"}"#)
+                .unwrap();
+        assert!(matches!(translate_event(&facet), EventTranslation::Ignore));
+        let error = parse_sse_event(
+            r#"{"type":"harness_error","prompt_id":"p","reason":{"kind":"max_tool_turns"}}"#,
+        )
+        .unwrap();
+        assert_eq!(event_prompt_id(&error), Some("p"));
+        assert!(matches!(
+            translate_event(&error),
+            EventTranslation::Error(_)
+        ));
+        let gap = parse_sse_event(r#"{"type":"stream_discontinuity","missed":3}"#).unwrap();
+        assert!(matches!(translate_event(&gap), EventTranslation::Error(_)));
+    }
+
+    #[test]
     fn test_deserialize_text_delta() {
         let json = r#"{"type":"content_block_delta","prompt_id":"abc","block_index":0,"delta":{"type":"text","text":"hello "}}"#;
         let evt: DaemonEvent = serde_json::from_str(json).unwrap();
@@ -2096,18 +2165,21 @@ mod tests {
 
     #[test]
     fn test_translate_openai_reasoning_delta() {
-        let evt = DaemonEvent::ContentBlockDelta {
-            prompt_id: "abc".into(),
-            block_index: 0,
-            delta: BlockDeltaPayload::OpenAiReasoning {
-                id: "r1".into(),
-                data: "reasoning text".into(),
-            },
-        };
-        match translate_event(&evt) {
-            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(_)) => {}
-            _ => panic!("Expected AgentThoughtChunk for OpenAI reasoning"),
-        }
+        let opaque: DaemonEvent = serde_json::from_value(serde_json::json!({
+            "type":"content_block_delta", "prompt_id":"p", "block_index":0,
+            "delta":{"type":"open_ai_reasoning_opaque","id":"rs_1","data":"encrypted"}
+        }))
+        .unwrap();
+        assert!(matches!(translate_event(&opaque), EventTranslation::Ignore));
+        let summary: DaemonEvent = serde_json::from_value(serde_json::json!({
+            "type":"content_block_delta", "prompt_id":"p", "block_index":0,
+            "delta":{"type":"open_ai_reasoning_summary","text":"Readable summary"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            translate_event(&summary),
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(_))
+        ));
     }
 
     #[test]

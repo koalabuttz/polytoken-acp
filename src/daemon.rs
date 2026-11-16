@@ -28,7 +28,7 @@ pub struct DaemonHandle {
     sessions_dir: PathBuf,
     /// Temp directory for the daemon process: contains credential file and
     /// logs. Cleaned up on terminate.
-    temp_dir: PathBuf,
+    temp_dir: Option<tempfile::TempDir>,
     /// Temp directory containing MCP server config forwarded from the ACP
     /// client. Cleaned up on terminate.
     mcp_config_dir: Option<PathBuf>,
@@ -91,9 +91,14 @@ impl DaemonHandle {
         let session_id = resume_session_id
             .map(|s| s.to_string())
             .unwrap_or_else(generate_session_id);
-        let temp_dir = std::env::temp_dir().join(format!("polytoken-acp-{}", session_id));
-        let log_dir = temp_dir.join("logs");
-        let cred_path = temp_dir.join("credential.json");
+        // A fresh private directory also prevents a resumed session from
+        // reusing a credential path or following an existing file symlink.
+        let temp_dir = tempfile::Builder::new()
+            .prefix("polytoken-acp-")
+            .tempdir()
+            .context("Failed to create private daemon directory")?;
+        let log_dir = temp_dir.path().join("logs");
+        let cred_path = temp_dir.path().join("credential.json");
 
         // Use a dedicated ACP sessions directory (~/.local/share/polytoken/sessions-acp/)
         // instead of the default `~/.local/share/polytoken/sessions/`.
@@ -116,11 +121,10 @@ impl DaemonHandle {
         let sessions_dir = acp_sessions_dir();
 
         // Create temp dir with 0700 permissions (polytoken requires it)
-        std::fs::create_dir_all(&temp_dir).context("Failed to create temp dir")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temp_dir, std::fs::Permissions::from_mode(0o700))
+            std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o700))
                 .context("Failed to set temp dir permissions")?;
         }
         std::fs::create_dir_all(&log_dir).context("Failed to create log dir")?;
@@ -131,16 +135,18 @@ impl DaemonHandle {
             "kind": "polytoken-daemon-credential",
             "token": bearer_token,
         });
-        std::fs::write(&cred_path, serde_json::to_string(&cred_json)?)
-            .context("Failed to write credential file")?;
-
-        // Polytoken requires the credential file to have 0600 permissions
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Set permissions at creation, before any token bytes are written.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&cred_path, std::fs::Permissions::from_mode(0o600))
-                .context("Failed to set credential file permissions")?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let credential = options
+            .open(&cred_path)
+            .context("Failed to create credential file")?;
+        serde_json::to_writer(credential, &cred_json).context("Failed to write credential file")?;
 
         // Remove any stale startup.json from a previous daemon run. Without this,
         // poll_startup would read the old file (state: "ready", old port) on its
@@ -148,12 +154,15 @@ impl DaemonHandle {
         // has had a chance to overwrite it. This happens when polytoken-acp
         // restarts (e.g. Paseo bounce) and resumes a session whose daemon was
         // killed or orphaned, leaving a stale startup.json behind.
-        let startup_path = sessions_dir.join(&session_id).join("startup.json");
-        if startup_path.exists() {
-            if let Err(e) = std::fs::remove_file(&startup_path) {
-                warn!(path = ?startup_path, error = %e, "Failed to remove stale startup.json");
-            } else {
-                debug!(path = ?startup_path, "Removed stale startup.json");
+        // Polytoken 0.9.x stores the v1 session tree beside the supplied
+        // legacy sessions directory, with a "-v1" suffix. Resume may migrate
+        // an older tree, so clear stale startup records in both locations.
+        let startup_paths = startup_paths(&sessions_dir, &session_id);
+        for startup_path in &startup_paths {
+            match std::fs::remove_file(startup_path) {
+                Ok(()) => debug!(path = ?startup_path, "Removed stale startup.json"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).context("Failed to remove stale startup.json"),
             }
         }
 
@@ -161,6 +170,8 @@ impl DaemonHandle {
 
         let mut cmd = Command::new("polytoken");
         cmd.arg("daemon")
+            .arg("--harness-type")
+            .arg("acp")
             .arg("--project-dir")
             .arg(cwd)
             .arg("--credential-file")
@@ -186,6 +197,7 @@ impl DaemonHandle {
         }
 
         let mut child = cmd
+            .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -226,7 +238,7 @@ impl DaemonHandle {
 
         // Poll startup.json until state == "ready"
         let timeout_result =
-            tokio::time::timeout(STARTUP_TIMEOUT, poll_startup(&startup_path)).await;
+            tokio::time::timeout(STARTUP_TIMEOUT, poll_startup(&startup_paths, &mut child)).await;
 
         let port = match timeout_result {
             Ok(Ok(p)) => p,
@@ -238,16 +250,14 @@ impl DaemonHandle {
                 // Check if the process is still alive
                 match child.try_wait() {
                     Ok(Some(status)) => bail!(
-                        "Polytoken daemon exited during startup with status: {}. Check logs at {:?}",
-                        status,
-                        log_dir
+                        "Polytoken daemon exited during startup with status: {}. Enable RUST_LOG=debug for daemon stderr.",
+                        status
                     ),
                     Ok(None) => {
                         let _ = child.kill().await;
                         bail!(
-                            "Polytoken daemon failed to become ready within {} seconds. Check logs at {:?}",
-                            STARTUP_TIMEOUT.as_secs(),
-                            log_dir
+                            "Polytoken daemon failed to become ready within {} seconds. Enable RUST_LOG=debug for daemon stderr.",
+                            STARTUP_TIMEOUT.as_secs()
                         );
                     }
                     Err(e) => bail!(
@@ -269,7 +279,7 @@ impl DaemonHandle {
             cwd: cwd.to_path_buf(),
             child: Some(child),
             sessions_dir,
-            temp_dir,
+            temp_dir: Some(temp_dir),
             mcp_config_dir: None,
         };
 
@@ -307,23 +317,20 @@ impl DaemonHandle {
             (Some(err), None) => bail!(
                 "Daemon startup.json says ready but /health is not responding after 20 attempts. \
                  Last transport error: {}. Child process: {}. \
-                 Check daemon logs at {:?}",
+                 Enable RUST_LOG=debug for daemon stderr.",
                 err,
-                child_status,
-                log_dir
+                child_status
             ),
             (None, Some(status)) => bail!(
                 "Daemon startup.json says ready but /health returned HTTP {} after 20 attempts. \
-                 Child process: {}. Check daemon logs at {:?}",
+                 Child process: {}. Enable RUST_LOG=debug for daemon stderr.",
                 status,
-                child_status,
-                log_dir
+                child_status
             ),
             _ => bail!(
                 "Daemon startup.json says ready but /health is not responding after 20 attempts. \
-                 Child process: {}. Check daemon logs at {:?}",
-                child_status,
-                log_dir
+                 Child process: {}. Enable RUST_LOG=debug for daemon stderr.",
+                child_status
             ),
         }
     }
@@ -544,10 +551,10 @@ impl DaemonHandle {
         // Clean up the daemon's temp directory (credential file and logs).
         // The credential file contains a bearer token, so remove it even if
         // the daemon process was already killed.
-        if let Err(e) = std::fs::remove_dir_all(&self.temp_dir) {
-            debug!(path = ?self.temp_dir, error = %e, "Failed to clean up daemon temp dir");
-        } else {
-            debug!(path = ?self.temp_dir, "Cleaned up daemon temp dir");
+        if let Some(dir) = self.temp_dir.take()
+            && let Err(e) = dir.close()
+        {
+            debug!(error = %e, "Failed to clean up daemon temp dir");
         }
 
         info!(session_id = %self.session_id, "Daemon terminated");
@@ -563,31 +570,55 @@ impl Drop for DaemonHandle {
     }
 }
 
-async fn poll_startup(startup_path: &Path) -> Result<u16> {
+async fn poll_startup(startup_paths: &[PathBuf], child: &mut Child) -> Result<u16> {
     loop {
-        if let Ok(content) = std::fs::read_to_string(startup_path)
-            && let Ok(startup) = serde_json::from_str::<StartupJson>(&content)
-        {
-            match startup.state.as_str() {
-                "ready" => {
-                    if let Some(port) = startup.port {
-                        return Ok(port);
+        if let Some(status) = child.try_wait().context("Failed to check daemon process")? {
+            bail!(
+                "Polytoken daemon exited during startup with status: {}. Enable RUST_LOG=debug for daemon stderr.",
+                status
+            );
+        }
+        for startup_path in startup_paths {
+            if let Ok(content) = std::fs::read_to_string(startup_path)
+                && let Ok(startup) = serde_json::from_str::<StartupJson>(&content)
+            {
+                match startup.state.as_str() {
+                    "ready" => {
+                        if let Some(port) = startup.port {
+                            return Ok(port);
+                        }
+                        bail!("startup.json has no port field");
                     }
-                    bail!("startup.json has no port field");
-                }
-                "failed" => {
-                    let msg = startup
-                        .message
-                        .unwrap_or_else(|| "unknown error".to_string());
-                    bail!("Polytoken daemon failed to start: {}", msg);
-                }
-                _ => {
-                    // Still starting up
+                    "failed" => {
+                        let msg = startup
+                            .message
+                            .unwrap_or_else(|| "unknown error".to_string());
+                        bail!("Polytoken daemon failed to start: {}", msg);
+                    }
+                    _ => {
+                        // Still starting up
+                    }
                 }
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Both layouts are daemon-owned; keep passing the legacy base to --sessions-dir
+/// so the daemon can locate and migrate old ACP sessions during resume.
+fn startup_paths(sessions_dir: &Path, session_id: &str) -> Vec<PathBuf> {
+    let name = sessions_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    vec![
+        sessions_dir
+            .with_file_name(format!("{name}-v1"))
+            .join(session_id)
+            .join("startup.json"),
+        sessions_dir.join(session_id).join("startup.json"),
+    ]
 }
 
 /// Returns the ACP-specific persistent sessions directory.
