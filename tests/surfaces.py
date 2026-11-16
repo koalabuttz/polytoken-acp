@@ -63,6 +63,8 @@ class MockDaemon(BaseHTTPRequestHandler):
         if path=="/history":
             self.respond({"checkpoint_id":"fixture-history","items":[],"next_page":None,"session_id":server.sid,"offset":0,"total_projected_items":0});return
         if path=="/events":
+            if "after=" not in self.path and server.block_surface_events:
+                self.respond({},503);return
             self.send_response(200);self.send_header("Content-Type","text/event-stream");self.send_header("Connection","close");self.end_headers()
             ordered="after=" in self.path
             index=len(server.events)
@@ -84,6 +86,8 @@ class MockDaemon(BaseHTTPRequestHandler):
                     server.sync_release.clear();server.pause_sync=True;server.sync_entered=False
                 self.respond({});return
             if action=="release-sync":server.sync_release.set();self.respond({});return
+            if action=="block-events":server.block_surface_events=True;self.respond({});return
+            if action=="unblock-events":server.block_surface_events=False;self.respond({});return
             if action=="replace":
                 server.generation+=1;server.surfaces[0]["generation"]=f"00000000-0000-7000-8000-{server.generation:012x}"
             elif action=="remove":server.surfaces=[]
@@ -105,6 +109,10 @@ class MockDaemon(BaseHTTPRequestHandler):
             self.respond(b"\x00\xff\xfe\xe2\x98\x83",status=418,headers=[("Content-Type","application/octet-stream"),("X-Repeat","one"),("X-Repeat","two"),("Set-Cookie","must-not-forward=1")]);return
         elif path=="/plugins/demo/http/stream":
             self.respond(b"x"*(CHUNK*8),headers=[("Content-Type","text/event-stream")]);return
+        elif path=="/plugins/demo/http/quiet":
+            self.send_response(200);self.send_header("Content-Type","text/event-stream");self.send_header("Connection","close");self.end_headers()
+            for _ in range(4):self.wfile.write(b"x");self.wfile.flush();time.sleep(.25)
+            time.sleep(45);return
         elif path=="/plugins/demo/http/hold":
             self.send_response(200);self.send_header("Content-Type","text/event-stream");self.send_header("Connection","close");self.end_headers()
             while True:self.wfile.write(b"data: {}\n\n");self.wfile.flush();time.sleep(.05)
@@ -123,6 +131,7 @@ def mock_daemon():
     server.sid=option("--session-id");server.epoch="epoch-"+server.sid
     server.generation=1;server.actions=0;server.events=[];server.condition=threading.Condition()
     server.pause_sync=False;server.sync_entered=False;server.sync_release=threading.Event();server.sync_release.set()
+    server.block_surface_events=False
     server.surfaces=[{"plugin_name":"demo","surface_id":"page","generation":"00000000-0000-7000-8000-000000000001","revision":"18446744073709551610","source":{"type":"plugin_http","path":"/surface"}}]
     startup=Path(option("--sessions-dir"));startup=startup.with_name(startup.name+"-v1")/server.sid/"startup.json"
     startup.parent.mkdir(parents=True,exist_ok=True);startup.write_text(json.dumps({"state":"ready","port":server.server_port}))
@@ -201,14 +210,40 @@ def main():
                 def daemon(path):
                     request=urllib.request.Request(base+path,method="POST",data=b"{}",headers={"Authorization":"Bearer "+token,"Content-Type":"application/json"})
                     with urllib.request.urlopen(request,timeout=5) as r:return json.load(r)
-                def collect(request,start=0):
-                    client.until(lambda m:m.get("method")==PREFIX+"httpEvent" and m["params"]["requestId"]==request and m["params"]["event"]["kind"]=="end",start,timeout=40)
+                def collect(request,start=0,timeout=40):
+                    client.until(lambda m:m.get("method")==PREFIX+"httpEvent" and m["params"]["requestId"]==request and m["params"]["event"]["kind"]=="end",start,timeout=timeout)
                     frames=[m["params"] for m in client.notifications[start:] if m.get("method")==PREFIX+"httpEvent" and m["params"]["requestId"]==request]
                     assert [int(f["sequence"]) for f in frames]==list(range(len(frames))),frames
                     return frames,b"".join(base64.b64decode(f["event"]["bodyBase64"]) for f in frames if f["event"]["kind"]=="body")
                 reply=client.call(PREFIX+"getHtml",target|{"requestId":"html"})
                 assert reply["bodyRevisionVerified"] is False and reply["observedSurface"]==surface
                 frames,html=collect("html");assert b"fixture" in html and "\u2603" in html.decode()
+                # Queue observer invalidation and a second preflight behind a
+                # paused snapshot, with event reconnection unavailable.
+                daemon("/fixture/pause-sync")
+                first=client.send(PREFIX+"getHtml",target|{"requestId":"pending-first"})
+                deadline=time.monotonic()+3
+                while not daemon("/fixture/stats")["syncEntered"]:
+                    assert time.monotonic()<deadline,"Preflight did not reach snapshot barrier"
+                    time.sleep(.01)
+                start=len(client.notifications)
+                daemon("/fixture/block-events");daemon("/fixture/disconnect")
+                time.sleep(.15)
+                second=client.send(PREFIX+"getHtml",target|{"requestId":"pending-second"})
+                time.sleep(.15)
+                daemon("/fixture/release-sync")
+                client.result(second,error=-32071)
+                client.until(lambda m:m.get("method")==PREFIX+"surfaceEvent" and m["params"]["event"].get("reason")=="sync_unavailable",start)
+                resets=[m["params"]["event"] for m in client.notifications[start:] if m.get("method")==PREFIX+"surfaceEvent" and m["params"]["event"]["kind"]=="reset"]
+                assert all(e["surfaces"] is None for e in resets),resets
+                client.call(PREFIX+"getHtml",target|{"requestId":"still-unavailable"},error=-32071)
+                while first not in client.responses:client.pump()
+                first_response=client.responses.pop(first)
+                if "result" in first_response:collect("pending-first")
+                else:assert first_response["error"]["code"]==-32071,first_response
+                daemon("/fixture/unblock-events")
+                client.until(lambda m:m.get("method")==PREFIX+"surfaceEvent" and m["params"]["event"].get("reason")=="reconnected",start)
+                client.call(PREFIX+"getHtml",target|{"requestId":"after-reconnect"});collect("after-reconnect")
                 data=b"\x00\xffbinary"
                 client.call(PREFIX+"request",target|{"requestId":"echo","method":"POST","path":"/echo","query":"x=1&x=2&a=%2f+%20","headers":[["x-test","one"],["x-test","two"],["datastar-request","true"]],"bodyBase64":base64.b64encode(data).decode()})
                 frames,echo=collect("echo");echo=json.loads(echo)
@@ -282,22 +317,35 @@ def main():
                 second=client.call("session/new",{"cwd":str(root),"mcpServers":[]})["sessionId"]
                 second_sub=client.call(PREFIX+"subscribe",{"sessionId":second})
                 second_target={"sessionId":second,"subscriptionId":second_sub["subscriptionId"],"daemonEpoch":second_sub["daemonEpoch"],"surface":{k:second_sub["surfaces"][0][k] for k in ["pluginName","surfaceId","generation","revision"]}}
-                if args.protocol==2:
-                    client.auto_ack=False
-                    client.call(PREFIX+"request",second_target|{"requestId":"timeout","method":"GET","path":"/stream"})
-                    client.until(lambda _:sum(m.get("params",{}).get("requestId")=="timeout" and m["params"]["event"]["kind"]=="body" for m in client.notifications if m.get("method")==PREFIX+"httpEvent")==4)
-                    started=time.monotonic();client.call("session/list",{});assert time.monotonic()-started<5,"Flow control blocked unrelated RPCs"
-                    frames,_=collect("timeout")
+                # Fill all slots with streams that send four chunks and remain
+                # open but quiet. One is ACKed; the others must expire without
+                # further upstream bytes or EOF and release their slots.
+                client.auto_ack=False
+                quiet_ids=[f"quiet-{n}" for n in range(8)]
+                for request in quiet_ids:
+                    client.call(PREFIX+"request",second_target|{"requestId":request,"method":"GET","path":"/quiet"})
+                client.until(lambda _:all(sum(m.get("params",{}).get("requestId")==request and m["params"]["event"]["kind"]=="body" for m in client.notifications if m.get("method")==PREFIX+"httpEvent")==4 for request in quiet_ids))
+                second_scope={k:second_target[k] for k in ["sessionId","subscriptionId"]}
+                client.call(PREFIX+"ack",second_scope|{"requestId":quiet_ids[0],"throughSequence":"4"})
+                client.call(PREFIX+"request",second_target|{"requestId":"full","method":"GET","path":"/surface"},error=-32075)
+                started=time.monotonic();client.call("session/list",{});assert time.monotonic()-started<5,"Flow control blocked unrelated RPCs"
+                deadline=time.monotonic()+31
+                for request in quiet_ids[1:]:
+                    frames,_=collect(request,timeout=max(.1,deadline-time.monotonic()))
                     assert frames[-1]["event"]["result"]["outcome"]=="error"
                     assert sum(f["event"]["kind"]=="body" for f in frames)==4
-                    client.auto_ack=True
+                assert not any(m.get("method")==PREFIX+"httpEvent" and m["params"]["requestId"]==quiet_ids[0] and m["params"]["event"]["kind"]=="end" for m in client.notifications),"ACKed quiet stream expired"
+                client.auto_ack=True
+                client.call(PREFIX+"getHtml",second_target|{"requestId":"slot-freed"});collect("slot-freed")
+                client.call(PREFIX+"cancel",second_scope|{"requestId":quiet_ids[0]})
+                frames,_=collect(quiet_ids[0]);assert frames[-1]["event"]["result"]["outcome"]=="cancelled"
                 client.call(PREFIX+"request",second_target|{"requestId":"owner-close","method":"GET","path":"/hold"})
                 client.call("session/close",{"sessionId":second})
                 frames,_=collect("owner-close");assert frames[-1]["event"]["result"]=={"outcome":"cancelled","reason":"session_closed"}
                 client.call(PREFIX+"subscribe",{"sessionId":second},error=-32002)
                 surviving=client.call(PREFIX+"subscribe",{"sessionId":sid})
                 client.call(PREFIX+"unsubscribe",{"sessionId":sid,"subscriptionId":surviving["subscriptionId"]})
-                print(f"PASS: ACP v{args.protocol} surface negotiation, HTML/binary HTTP, queries/headers, flow control, cancellation, stale generations, removals, reconnect/reset")
+                print(f"PASS: ACP v{args.protocol} surfaces including queued preflight rejection, quiet-upstream ACK deadlines, acknowledged quiet streams, and slot release")
             except BaseException:
                 log.flush();log.seek(0);print(log.read()[-10000:]);raise
             finally:client.close()

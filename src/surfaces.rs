@@ -7,10 +7,10 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -24,6 +24,7 @@ pub const MAX_HTML: usize = 256 * 1024;
 pub const CHUNK: usize = 16384;
 const WINDOW: usize = 4;
 const MAX_REQUESTS: usize = 4096;
+const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn offered(meta: Option<&Value>) -> bool {
     meta.and_then(|m| m[CAPABILITY]["versions"].as_array())
@@ -134,11 +135,16 @@ struct Subscription {
 struct Control {
     stop: CancellationToken,
     credits: Semaphore,
-    sent: AtomicU64,
-    acked: Mutex<u64>,
+    delivery: Mutex<Delivery>,
     reason: Mutex<&'static str>,
     surface: SurfaceRef,
     ack_changed: tokio::sync::Notify,
+}
+#[derive(Default)]
+struct Delivery {
+    sent: u64,
+    acked: u64,
+    pending: VecDeque<(u64, tokio::time::Instant)>,
 }
 impl Control {
     fn cancel(&self, reason: &'static str) {
@@ -149,16 +155,68 @@ impl Control {
         }
     }
     fn ack(&self, n: u64) -> std::result::Result<(), Error> {
-        let mut last = self.acked.lock().unwrap();
-        if n > self.sent.load(Ordering::SeqCst) {
+        let mut delivery = self.delivery.lock().unwrap();
+        if n > delivery.sent {
             return Err(invalid("Acknowledgement exceeds last body sequence"));
         }
-        if n > *last {
-            self.credits.add_permits((n - *last) as usize);
-            *last = n;
-            self.ack_changed.notify_one();
+        if n > delivery.acked {
+            self.credits.add_permits((n - delivery.acked) as usize);
+            delivery.acked = n;
+            while delivery.pending.front().is_some_and(|(seq, _)| *seq <= n) {
+                delivery.pending.pop_front();
+            }
+            self.ack_changed.notify_waiters();
         }
         Ok(())
+    }
+    fn sent(&self, sequence: u64) {
+        let mut delivery = self.delivery.lock().unwrap();
+        delivery.sent = sequence;
+        delivery
+            .pending
+            .push_back((sequence, tokio::time::Instant::now()));
+        self.ack_changed.notify_waiters();
+    }
+    async fn ack_timeout(&self) {
+        loop {
+            let changed = self.ack_changed.notified();
+            tokio::pin!(changed);
+            // Register before inspecting delivery so sends/ACKs cannot be
+            // missed, including when EOF also awaits acknowledgements.
+            changed.as_mut().enable();
+            let deadline = {
+                let delivery = self.delivery.lock().unwrap();
+                let deadline = delivery
+                    .pending
+                    .front()
+                    .map(|(_, sent)| *sent + ACK_TIMEOUT);
+                // Decide expiry under the ACK lock too: an ACK received just
+                // before the deadline must not lose to a cached older view.
+                if deadline.is_some_and(|d| d <= tokio::time::Instant::now()) {
+                    return;
+                }
+                deadline
+            };
+            if let Some(deadline) = deadline {
+                tokio::select! {
+                    _ = &mut changed => {},
+                    _ = tokio::time::sleep_until(deadline) => {},
+                }
+            } else {
+                changed.await;
+            }
+        }
+    }
+    async fn drain_acks(&self) {
+        loop {
+            let changed = self.ack_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.delivery.lock().unwrap().pending.is_empty() {
+                return;
+            }
+            changed.await;
+        }
     }
 }
 
@@ -427,7 +485,7 @@ impl Hub {
                         ],
                     )?;
                     let target: Target = serde_json::from_value(params.clone()).map_err(invalid)?;
-                    let surface = root.validate(&target, true).await?;
+                    let surface = root.validate(&target).await?;
                     params["method"] = json!("GET");
                     params["path"] = surface.source["path"].clone();
                     params["headers"] = json!([["accept", "text/html"]]);
@@ -459,7 +517,7 @@ impl Hub {
                 ) {
                     return Err(invalid("Unsupported HTTP method"));
                 }
-                let surface = root.validate(&http.target, true).await?;
+                let surface = root.validate(&http.target).await?;
                 let endpoint = root.endpoint();
                 let url = plugin_url(
                     &endpoint,
@@ -487,8 +545,7 @@ impl Hub {
                 let control = Arc::new(Control {
                     stop: root.stop.child_token(),
                     credits: Semaphore::new(WINDOW),
-                    sent: AtomicU64::new(0),
-                    acked: Mutex::new(0),
+                    delivery: Mutex::new(Delivery::default()),
                     reason: Mutex::new("cancelled"),
                     surface: http.target.surface.clone(),
                     ack_changed: tokio::sync::Notify::new(),
@@ -571,15 +628,15 @@ impl Root {
         let snapshot = self.snapshot().await?;
         self.update(sub, &snapshot, reset).await
     }
-    async fn validate(
-        &self,
-        target: &Target,
-        refresh: bool,
-    ) -> std::result::Result<Surface, Error> {
+    async fn validate(&self, target: &Target) -> std::result::Result<Surface, Error> {
         target.surface.validate().map_err(invalid)?;
         if target.session_id != self.id {
             return Err(fault(-32002, "Wrong owning session"));
         }
+        // An observer invalidation may have queued before this preflight.
+        // Recheck readiness after taking the same lock as invalidation; only
+        // the observer may establish a new baseline after losing its stream.
+        let _refresh = self.catalog_refresh.lock().await;
         {
             let s = self.state.lock().await;
             check_subscription(&s, &target.subscription_id)?;
@@ -590,10 +647,12 @@ impl Root {
                 return Err(fault(-32071, "Surface observation unavailable"));
             }
         }
-        if refresh {
-            self.refresh(&target.subscription_id, None)
-                .await
-                .map_err(failed)?;
+        let snapshot = self.snapshot().await.map_err(failed)?;
+        self.update(&target.subscription_id, &snapshot, None)
+            .await
+            .map_err(failed)?;
+        if self.stop.is_cancelled() {
+            return Err(fault(-32002, "Session closed"));
         }
         let s = self.state.lock().await;
         check_target(&s, target)
@@ -728,7 +787,7 @@ impl Root {
         let mut sequence = 0u64;
         let mut headers_sent = false;
         let work = async {
-            self.validate(&http.target, true)
+            self.validate(&http.target)
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             let request = http_client()
@@ -737,7 +796,7 @@ impl Root {
                 .bearer_auth(&endpoint.token)
                 .body(body);
             let response = tokio::time::timeout(Duration::from_secs(20), request.send()).await??;
-            self.validate(&http.target, true)
+            self.validate(&http.target)
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             self.emit_http(&http,sequence,json!({"kind":"headers","status":response.status().as_u16(),"headers":response_headers(response.headers())}));
@@ -754,13 +813,10 @@ impl Root {
                     bail!("Upstream chunk exceeds buffer limit");
                 }
                 for chunk in bytes.chunks(CHUNK) {
-                    let permit =
-                        tokio::time::timeout(Duration::from_secs(30), control.credits.acquire())
-                            .await
-                            .context("ack_timeout")??;
+                    let permit = control.credits.acquire().await?;
                     permit.forget();
                     sequence += 1;
-                    control.sent.store(sequence, Ordering::SeqCst);
+                    control.sent(sequence);
                     self.emit_http(
                         &http,
                         sequence,
@@ -770,19 +826,12 @@ impl Root {
             }
             // Keep the concurrency slot until the consumer has accepted the
             // final body bytes, not merely until the upstream socket hit EOF.
-            loop {
-                let notified = control.ack_changed.notified();
-                if *control.acked.lock().unwrap() == sequence {
-                    break;
-                }
-                tokio::time::timeout(Duration::from_secs(30), notified)
-                    .await
-                    .context("ack_timeout")?;
-            }
+            control.drain_acks().await;
             Ok::<_, anyhow::Error>(())
         };
         let outcome = tokio::select! {
             _=control.stop.cancelled()=>json!({"outcome":"cancelled","reason":*control.reason.lock().unwrap()}),
+            _=control.ack_timeout()=>json!({"outcome":"error","code":"transport_error","message":"Plugin HTTP acknowledgement timeout"}),
             result=work=>match result {Ok(())=>json!({"outcome":"complete"}),Err(error)=>{tracing::debug!(%error,"Plugin HTTP relay failed");json!({"outcome":"error","code":"transport_error","message":"Plugin HTTP transport or flow-control limit failed"})}}
         };
         let outcome = if control.stop.is_cancelled() {
@@ -1071,13 +1120,16 @@ mod tests {
     fn control() -> Control {
         Control {
             stop: CancellationToken::new(),
-            credits: Semaphore::new(0),
-            sent: AtomicU64::new(4),
-            acked: Mutex::new(0),
+            credits: Semaphore::new(WINDOW),
+            delivery: Mutex::new(Delivery::default()),
             reason: Mutex::new("cancelled"),
             surface: surface(),
             ack_changed: tokio::sync::Notify::new(),
         }
+    }
+    fn deliver(control: &Control, sequence: u64) {
+        control.credits.try_acquire().unwrap().forget();
+        control.sent(sequence);
     }
     #[test]
     fn request_urls_cannot_escape_a_plugin_and_queries_keep_their_bytes() {
@@ -1140,6 +1192,9 @@ mod tests {
     #[test]
     fn credit_acknowledgements_are_monotonic_bounded_and_idempotent() {
         let c = control();
+        for sequence in 1..=4 {
+            deliver(&c, sequence);
+        }
         assert!(c.ack(5).is_err());
         assert_eq!(c.credits.available_permits(), 0);
         c.ack(3).unwrap();
@@ -1151,6 +1206,122 @@ mod tests {
         assert_eq!(c.credits.available_permits(), 4);
         c.cancel("surface_invalidated");
         assert!(c.stop.is_cancelled());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn quiet_upstream_and_new_bytes_do_not_extend_an_unacked_deadline() {
+        let c = control();
+        deliver(&c, 1);
+        let timeout = c.ack_timeout();
+        tokio::pin!(timeout);
+        assert!(futures::poll!(&mut timeout).is_pending());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        deliver(&c, 2);
+        c.ack(0).unwrap();
+        assert!(futures::poll!(&mut timeout).is_pending());
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(futures::poll!(&mut timeout).is_ready());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn partial_ack_keeps_the_remaining_chunks_original_deadline() {
+        let c = control();
+        deliver(&c, 1);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        deliver(&c, 2);
+        c.ack(1).unwrap();
+        let timeout = c.ack_timeout();
+        tokio::pin!(timeout);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(futures::poll!(&mut timeout).is_pending());
+        c.ack(1).unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(futures::poll!(&mut timeout).is_ready());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn quiet_acknowledged_streams_remain_valid_and_later_bytes_start_a_new_deadline() {
+        let c = control();
+        let timeout = c.ack_timeout();
+        tokio::pin!(timeout);
+        assert!(futures::poll!(&mut timeout).is_pending());
+        tokio::time::advance(ACK_TIMEOUT * 2).await;
+        assert!(futures::poll!(&mut timeout).is_pending());
+        deliver(&c, 1);
+        assert!(futures::poll!(&mut timeout).is_pending());
+        tokio::time::advance(ACK_TIMEOUT - Duration::from_secs(1)).await;
+        c.ack(1).unwrap();
+        tokio::time::advance(ACK_TIMEOUT * 2).await;
+        assert!(futures::poll!(&mut timeout).is_pending());
+        deliver(&c, 2);
+        assert!(futures::poll!(&mut timeout).is_pending());
+        tokio::time::advance(ACK_TIMEOUT).await;
+        assert!(futures::poll!(&mut timeout).is_ready());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn eof_and_deadline_waiters_both_observe_the_final_ack() {
+        let c = control();
+        deliver(&c, 1);
+        let timeout = c.ack_timeout();
+        let drain = c.drain_acks();
+        tokio::pin!(timeout, drain);
+        assert!(futures::poll!(&mut timeout).is_pending());
+        assert!(futures::poll!(&mut drain).is_pending());
+        c.ack(1).unwrap();
+        assert!(futures::poll!(&mut drain).is_ready());
+        tokio::time::advance(ACK_TIMEOUT * 2).await;
+        assert!(futures::poll!(&mut timeout).is_pending());
+    }
+    #[tokio::test]
+    async fn queued_preflight_cannot_restore_an_invalidated_observer_baseline() {
+        let (transport, _peer) = agent_client_protocol::Channel::duplex();
+        agent_client_protocol::Agent
+            .v1()
+            .connect_with(transport, async |conn| {
+                let hub = Arc::new(Hub::default());
+                // No server: a rejected preflight must not attempt a snapshot.
+                hub.bind(
+                    "root",
+                    Endpoint::new("http://127.0.0.1:1", "private"),
+                    &conn,
+                )
+                .await;
+                let root = hub.roots.lock().unwrap()["root"].clone();
+                {
+                    let mut state = root.state.lock().await;
+                    state.subscription = Some(Subscription {
+                        id: "subscription".into(),
+                        stop: CancellationToken::new(),
+                    });
+                    state.ready = true;
+                    state.epoch = "epoch".into();
+                }
+                let target = Target {
+                    session_id: "root".into(),
+                    subscription_id: "subscription".into(),
+                    daemon_epoch: "epoch".into(),
+                    surface: surface(),
+                };
+                let gate = root.catalog_refresh.lock().await;
+                let invalidate = async {
+                    let _gate = root.catalog_refresh.lock().await;
+                    root.invalidate("sync_unavailable", Some("subscription"))
+                        .await;
+                };
+                let preflight = root.validate(&target);
+                tokio::pin!(invalidate, preflight);
+                // Queue invalidation first, then the preflight, behind a held
+                // snapshot lock. Tokio's mutex preserves this ordering.
+                assert!(futures::poll!(&mut invalidate).is_pending());
+                assert!(futures::poll!(&mut preflight).is_pending());
+                drop(gate);
+                invalidate.await;
+                let error = preflight.await.unwrap_err();
+                assert_eq!(serde_json::to_value(error).unwrap()["code"], -32071);
+                let state = root.state.lock().await;
+                assert!(!state.ready);
+                assert_eq!(state.sequence, 1); // Only reset-null, no resynchronized.
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
     #[test]
     fn catalog_preserves_large_revisions_and_never_substitutes_missing_state() {
