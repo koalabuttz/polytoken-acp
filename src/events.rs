@@ -228,6 +228,9 @@ pub enum SubagentResultKind {
     Success,
     Failure,
     Cancelled,
+    Salvaged,
+    #[serde(other)]
+    Unknown,
 }
 
 /// The `outcome` object on `subagent_completed` events.
@@ -657,6 +660,8 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
                 SubagentResultKind::Success => "success",
                 SubagentResultKind::Failure => "failure",
                 SubagentResultKind::Cancelled => "cancelled",
+                SubagentResultKind::Salvaged => "salvaged",
+                SubagentResultKind::Unknown => "unknown",
             });
             format!(
                 "handle={} summary={} outcome={}",

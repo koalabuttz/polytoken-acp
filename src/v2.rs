@@ -45,6 +45,7 @@ struct Session {
     stop: CancellationToken,
     observing: std::sync::atomic::AtomicBool,
     changed: tokio::sync::Notify,
+    refresh_children: tokio::sync::Notify,
 }
 
 struct Inner {
@@ -68,6 +69,7 @@ struct Inner {
     foreground: bool,
     state: Value,
     record: Value,
+    children_paused: bool,
 }
 
 impl Manager {
@@ -80,6 +82,34 @@ impl Manager {
     ) -> std::result::Result<Value, Error> {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::new(-32000, "Connection is closing"));
+        }
+        if let Some(id) = params["sessionId"]
+            .as_str()
+            .filter(|id| crate::children::Hub::child_id(id))
+        {
+            if method != "session/cancel" {
+                return Err(invalid("This operation is unavailable on worker sessions"));
+            }
+            let (root, grant) = features.children.permit(id).await.ok_or_else(unknown)?;
+            let session = self
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&root)
+                .cloned()
+                .ok_or_else(unknown)?;
+            let inner = session.inner.lock().await;
+            features
+                .children
+                .cancel(
+                    id,
+                    inner.daemon.base_url(),
+                    inner.daemon.bearer_token(),
+                    grant,
+                )
+                .await
+                .map_err(internal)?;
+            return Ok(json!({}));
         }
         match method {
             "session/new" | "session/resume" => self.setup(method, params, conn, features).await,
@@ -132,6 +162,17 @@ impl Manager {
                                 .await
                                 .map_err(internal)?;
                         if snapshot["turn"].is_object() {
+                            session
+                                .features
+                                .children
+                                .cancel_waited(
+                                    &session.id,
+                                    inner.daemon.base_url(),
+                                    inner.daemon.bearer_token(),
+                                    &snapshot,
+                                )
+                                .await
+                                .map_err(internal)?;
                             sync::mutate(inner.daemon.base_url(), inner.daemon.bearer_token(), "/turn/cancel",
                                 json!({"prompt_id":snapshot["turn"]["prompt_id"],"generation":snapshot["turn"]["generation"]}), &snapshot).await.map_err(internal)?;
                         }
@@ -313,6 +354,7 @@ impl Manager {
                 stop: CancellationToken::new(),
                 observing: std::sync::atomic::AtomicBool::new(false),
                 changed: tokio::sync::Notify::new(),
+                refresh_children: tokio::sync::Notify::new(),
                 inner: tokio::sync::Mutex::new(Inner {
                     daemon,
                     temp,
@@ -334,6 +376,7 @@ impl Manager {
                     foreground: false,
                     state: Value::Null,
                     record,
+                    children_paused: true,
                 }),
             });
             self.sessions.lock().unwrap().insert(id, session.clone());
@@ -365,6 +408,25 @@ impl Manager {
                     .map_err(internal)?;
             }
         }
+        inner.children_paused = true;
+        if resume {
+            if !replay && !session.observing.load(std::sync::atomic::Ordering::SeqCst) {
+                session
+                    .features
+                    .children
+                    .baseline(
+                        &session.id,
+                        inner.daemon.base_url(),
+                        inner.daemon.bearer_token(),
+                        &session.conn,
+                        true,
+                    )
+                    .await
+                    .map_err(internal)?;
+            } else {
+                session.children(&inner, replay, false).await;
+            }
+        }
         if replay {
             session.history(&mut inner, true).await.map_err(internal)?;
             session
@@ -379,7 +441,9 @@ impl Manager {
         if !resume {
             result["sessionId"] = json!(session.id);
         }
+        inner.children_paused = false;
         drop(inner);
+        session.refresh_children.notify_one();
         // Each session has exactly one observer, even across active resumes.
         if !session.stop.is_cancelled() && !existing_observer(&session) {
             let observer = session.clone();
@@ -458,6 +522,7 @@ impl Manager {
         let session = self.sessions.lock().unwrap().remove(id);
         if let Some(session) = session {
             session.stop.cancel();
+            session.features.children.close(id);
             let mut inner = session.inner.lock().await;
             inner.closed = true;
             inner.daemon.terminate().await;
@@ -519,6 +584,28 @@ fn existing_observer(session: &Session) -> bool {
 }
 
 impl Session {
+    async fn children(&self, inner: &Inner, replay: bool, live: bool) {
+        if let Err(error) = self
+            .features
+            .children
+            .refresh(
+                &self.id,
+                inner.daemon.base_url(),
+                inner.daemon.bearer_token(),
+                &self.conn,
+                true,
+                replay,
+                live,
+            )
+            .await
+        {
+            tracing::warn!(%error, "Worker projection unavailable; preserving ordinary activity");
+            self.features
+                .children
+                .unobservable(&self.id, &self.conn, true)
+                .await;
+        }
+    }
     fn emit(&self, update: Value) -> Result<()> {
         let typed: agent_client_protocol::v2::schema::SessionUpdate =
             serde_json::from_value(update)?;
@@ -829,6 +916,9 @@ impl Session {
     }
 
     async fn history(&self, inner: &mut Inner, force: bool) -> Result<()> {
+        if !inner.children_paused {
+            self.children(inner, false, true).await;
+        }
         let items = sync::history(inner.daemon.base_url(), inner.daemon.bearer_token()).await?;
         let updates = history_updates(&items, &mut inner.record);
         for update in updates {
@@ -839,6 +929,9 @@ impl Session {
     }
 
     async fn current(&self, inner: &mut Inner, force: bool) -> Result<()> {
+        if !inner.children_paused {
+            self.children(inner, false, true).await;
+        }
         let snapshot = sync::snapshot(inner.daemon.base_url(), inner.daemon.bearer_token()).await?;
         let jobs = sync::get(
             inner.daemon.base_url(),
@@ -849,6 +942,19 @@ impl Session {
         let mut background = Vec::new();
         for job in jobs.as_array().context("Invalid jobs catalog")? {
             let id = job["handle"].as_str().context("Job has no ID")?;
+            if job["kind"] == "subagent" {
+                if !self.features.children.represented(&self.id, id).await {
+                    // Work discovered after the replay capture belongs to the
+                    // fresh observation after resume, not historical traffic.
+                    if inner.children_paused {
+                        continue;
+                    }
+                    self.children(inner, false, !inner.children_paused).await;
+                }
+                if !self.features.children.fallback(&self.id, id).await {
+                    continue;
+                }
+            }
             let status = job["status"]["status"]
                 .as_str()
                 .context("Invalid job status")?;
@@ -969,6 +1075,9 @@ impl Session {
     }
 
     async fn pending_questions(&self, inner: &mut Inner, snapshot: &Value) -> Result<()> {
+        if inner.children_paused {
+            return Ok(());
+        }
         if snapshot["interrogatives"]
             .as_array()
             .is_none_or(Vec::is_empty)
@@ -989,14 +1098,36 @@ impl Session {
             let Some(id) = event["interrogative_id"].as_str() else {
                 continue;
             };
+            if inner.handled.contains(id) {
+                continue;
+            }
+            let mut event = event.clone();
+            let (sid, cwd) = if let Some(handle) = event["subagent_handle"].as_str() {
+                // The question read can be ahead of the earlier jobs/history
+                // capture. Establish its child before emitting an RPC to it.
+                self.children(inner, false, true).await;
+                match self.features.children.route(&self.id, handle).await {
+                    Some(route) => route,
+                    None if self.features.children.represented(&self.id, handle).await => continue,
+                    None => {
+                        event["question"] = json!(format!(
+                            "Worker {handle}: {}",
+                            event["question"].as_str().unwrap_or("Permission required")
+                        ));
+                        (self.id.clone(), inner.cwd.clone())
+                    }
+                }
+            } else {
+                (self.id.clone(), inner.cwd.clone())
+            };
             if inner.handled.insert(id.to_string()) {
                 agent::forward_v2_interrogative(
                     &self.conn,
-                    event,
-                    &self.id,
+                    &event,
+                    &sid,
                     inner.daemon.base_url(),
                     inner.daemon.bearer_token(),
-                    &inner.cwd,
+                    &cwd,
                     &self.features,
                 )
                 .await;
@@ -1125,6 +1256,7 @@ impl Session {
                 self.current(inner, false).await?;
             }
             "history_rewritten" => {
+                self.features.children.rescan(&self.id).await;
                 self.history(inner, true).await?;
                 self.notice("Conversation history changed", "The retained conversation was synchronized after a clear, rewind or compaction.")?;
             }
@@ -1223,6 +1355,11 @@ impl Session {
         loop {
             let chunk = tokio::select! {
                 _=self.stop.cancelled()=>return Ok(()),
+                _=self.refresh_children.notified()=> {
+                    let mut inner=self.inner.lock().await;
+                    self.current(&mut inner,false).await?;
+                    continue;
+                },
                 chunk=stream.next()=>match chunk {Some(chunk)=>chunk?,None=>bail!("Ordered stream closed")},
                 _=tokio::time::sleep(std::time::Duration::from_secs(20))=> {
                     // Quiet streams still refresh background state and detect a
@@ -1267,6 +1404,7 @@ impl Session {
     }
 
     async fn reset(&self) -> Result<()> {
+        self.features.children.rescan(&self.id).await;
         let mut inner = self.inner.lock().await;
         let snapshot = sync::snapshot(inner.daemon.base_url(), inner.daemon.bearer_token()).await?;
         if inner.foreground && !snapshot["turn"].is_object() {

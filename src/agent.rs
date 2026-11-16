@@ -57,6 +57,8 @@ struct AgentState {
 /// fallbacks. Clients that want precise control advertise their support.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientFeatureSupport {
+    pub(crate) supports_child_sessions: bool,
+    pub(crate) children: Arc<crate::children::Hub>,
     /// Whether the client can render an `elicitation/create` form
     /// (single-select enum, multi-select, etc.).
     supports_elicitation: bool,
@@ -78,6 +80,8 @@ impl Default for ClientFeatureSupport {
     /// to `false` since it requires explicit formal capability advertisement.
     fn default() -> Self {
         Self {
+            supports_child_sessions: false,
+            children: Arc::new(crate::children::Hub::default()),
             supports_elicitation: false,
             supports_subagent_events: true,
             supports_system_reminder: true,
@@ -110,6 +114,8 @@ impl ClientFeatureSupport {
             Some(methods) => {
                 let has = |name: &str| methods.iter().any(|m| m.as_str() == Some(name));
                 Self {
+                    supports_child_sessions: caps.subagents.is_some(),
+                    children: Arc::new(crate::children::Hub::default()),
                     supports_elicitation,
                     supports_subagent_events: has("subagent_started") || has("subagent_completed"),
                     supports_system_reminder: has("system_reminder"),
@@ -122,6 +128,7 @@ impl ClientFeatureSupport {
                 }
             }
             None => Self {
+                supports_child_sessions: caps.subagents.is_some(),
                 supports_elicitation,
                 ..Default::default()
             },
@@ -505,6 +512,67 @@ fn validate_saved_session_id(id: &str) -> Result<(), agent_client_protocol::Erro
     Ok(())
 }
 
+async fn prepare_children(
+    state: &Arc<Mutex<AgentState>>,
+    daemon: &DaemonHandle,
+    conn: &ConnectionTo<Client>,
+    replay: bool,
+) {
+    let features = state
+        .lock()
+        .unwrap()
+        .client_features
+        .clone()
+        .unwrap_or_default();
+    if features.supports_child_sessions {
+        features.children.close(daemon.session_id());
+        let result = if replay {
+            features
+                .children
+                .refresh(
+                    daemon.session_id(),
+                    daemon.base_url(),
+                    daemon.bearer_token(),
+                    conn,
+                    false,
+                    replay,
+                    false,
+                )
+                .await
+        } else {
+            features
+                .children
+                .baseline(
+                    daemon.session_id(),
+                    daemon.base_url(),
+                    daemon.bearer_token(),
+                    conn,
+                    false,
+                )
+                .await
+        };
+        if let Err(error) = result {
+            warn!(%error,"Worker history unavailable");
+        }
+    }
+}
+
+fn observe_children(state: &Arc<Mutex<AgentState>>, sid: &str, conn: &ConnectionTo<Client>) {
+    let s = state.lock().unwrap();
+    let features = s.client_features.clone().unwrap_or_default();
+    if features.supports_child_sessions
+        && let Some(d) = s.sessions.get(sid)
+    {
+        features.children.clone().observe_v1(
+            sid.into(),
+            d.base_url().into(),
+            d.bearer_token().into(),
+            conn.clone(),
+            features,
+        );
+    }
+}
+
 async fn handle_new_session(
     state: &Arc<Mutex<AgentState>>,
     req: acp::NewSessionRequest,
@@ -597,6 +665,7 @@ async fn handle_new_session(
             }
             let response = response.meta(setup_meta(&req.cwd, &daemon_state));
             let respond_result = responder.respond(response);
+            observe_children(state, &session_id, &cx);
 
             // Now send notifications — the client has the session ID from the
             // response above and will accept these.
@@ -775,6 +844,8 @@ async fn handle_resume_session(
                 daemon.set_mcp_config_dir(dir.clone());
             }
 
+            prepare_children(state, &daemon, &cx, false).await;
+
             state
                 .lock()
                 .unwrap()
@@ -847,6 +918,7 @@ async fn handle_resume_session(
             }
             let response = response.meta(setup_meta(&req.cwd, &daemon_state));
             let respond_result = responder.respond(response);
+            observe_children(state, &session_id, &cx);
 
             // Send session_info_update with the title from the daemon state.
             if let Ok(ref ds) = daemon_state
@@ -1036,6 +1108,7 @@ async fn handle_load_session(
                 daemon.base_url().to_string(),
                 daemon.bearer_token().to_string(),
             );
+            prepare_children(state, &daemon, &cx, true).await;
             match fetch_history_raw(&base_url, &bearer_token).await {
                 Ok(history_items) => {
                     let notifications =
@@ -1130,7 +1203,9 @@ async fn handle_load_session(
             if !config_options.is_empty() {
                 response = response.config_options(config_options);
             }
-            responder.respond(response.meta(setup_meta(&req.cwd, &daemon_state)))
+            let result = responder.respond(response.meta(setup_meta(&req.cwd, &daemon_state)));
+            observe_children(state, &session_id, &cx);
+            result
         }
         Err(e) => {
             error!(error = %e, session_id = %session_id, "Failed to load session");
@@ -1152,6 +1227,15 @@ async fn handle_close_session(
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
     info!(session_id = %session_id, "ACP session/close");
+    if crate::children::Hub::child_id(&session_id) {
+        return responder.respond_with_error(
+            agent_client_protocol::Error::invalid_params()
+                .data("Closing a worker session is unavailable"),
+        );
+    }
+    if let Some(features) = &state.lock().unwrap().client_features {
+        features.children.close(&session_id);
+    }
 
     // Remove the daemon and prompt queue from the maps.
     // Dropping the Sender causes the processor task's rx.recv() to return
@@ -1430,8 +1514,64 @@ async fn run_prompt_turn(
     }
 }
 
+fn subagent_tool_status(
+    outcome: Option<&crate::events::SubagentResultKind>,
+) -> acp::ToolCallStatus {
+    use crate::events::SubagentResultKind::*;
+    match outcome {
+        Some(Success) => acp::ToolCallStatus::Completed,
+        Some(Failure | Cancelled) => acp::ToolCallStatus::Failed,
+        _ => acp::ToolCallStatus::Pending,
+    }
+}
+
+async fn native_worker(
+    conn: &ConnectionTo<Client>,
+    features: &ClientFeatureSupport,
+    sid: &str,
+    base: &str,
+    token: &str,
+    handle: &str,
+) -> bool {
+    if !features.supports_child_sessions {
+        return false;
+    }
+    if !features.children.represented(sid, handle).await {
+        let _ = features
+            .children
+            .refresh(sid, base, token, conn, false, false, true)
+            .await;
+    }
+    !features.children.fallback(sid, handle).await
+}
+
 async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotification) {
     let session_id = notif.session_id.0.to_string();
+    if crate::children::Hub::child_id(&session_id) {
+        let features = state
+            .lock()
+            .unwrap()
+            .client_features
+            .clone()
+            .unwrap_or_default();
+        if let Some((root, grant)) = features.children.permit(&session_id).await {
+            let info = state
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&root)
+                .map(|d| (d.base_url().to_string(), d.bearer_token().to_string()));
+            if let Some((base, token)) = info
+                && let Err(error) = features
+                    .children
+                    .cancel(&session_id, &base, &token, grant)
+                    .await
+            {
+                warn!(%error,"Child cancellation unavailable");
+            }
+        }
+        return;
+    }
     info!(session_id = %session_id, "ACP cancel");
 
     tracing::info!(
@@ -1478,6 +1618,20 @@ async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotifi
                     return;
                 }
                 let body = serde_json::json!({"prompt_id":target["prompt_id"],"generation":snapshot["turn"]["generation"]});
+                let features = state
+                    .lock()
+                    .unwrap()
+                    .client_features
+                    .clone()
+                    .unwrap_or_default();
+                if features.supports_child_sessions
+                    && let Err(error) = features
+                        .children
+                        .cancel_waited(&session_id, &base_url, &bearer, &snapshot)
+                        .await
+                {
+                    warn!(%error,"Descendant cancellation failed");
+                }
                 if let Err(error) =
                     crate::sync::mutate(&base_url, &bearer, "/turn/cancel", body, &snapshot).await
                 {
@@ -2671,6 +2825,27 @@ async fn connect_and_consume(
                         .into(),
                 );
             }
+            if client_features.supports_child_sessions
+                && matches!(
+                    record["type"].as_str(),
+                    Some(
+                        "jobs_changed"
+                            | "subagent_changed"
+                            | "history_appended"
+                            | "interrogative_registered"
+                    )
+                )
+                && let Err(error) = client_features
+                    .children
+                    .refresh(session_id, base_url, bearer_token, conn, false, false, true)
+                    .await
+            {
+                warn!(%error,"Worker projection unavailable");
+                client_features
+                    .children
+                    .unobservable(session_id, conn, false)
+                    .await;
+            }
             let mut translated = projection.record_events(&record);
             if record["type"] == "history_appended"
                 || record["type"] == "turn_completed"
@@ -2712,6 +2887,16 @@ async fn connect_and_consume(
                 }
             }
             for event in translated {
+                // Native child questions have their own persistent observer.
+                if client_features.supports_child_sessions
+                    && let Some(handle) = event["subagent_handle"].as_str()
+                    && client_features
+                        .children
+                        .represented(session_id, handle)
+                        .await
+                {
+                    continue;
+                }
                 match process_sse_event(
                     &event.to_string(),
                     prompt_id,
@@ -2968,6 +3153,18 @@ async fn process_sse_event(
             subagent_type,
             model,
         } => {
+            if native_worker(
+                conn,
+                client_features,
+                session_id,
+                base_url,
+                bearer_token,
+                &handle,
+            )
+            .await
+            {
+                return ConsumeOutcome::Continue;
+            }
             // 1. Send standard ACP ToolCall so Paseo renders it in the timeline.
             let tool_call = acp::ToolCall::new(handle.clone(), subagent_type.clone())
                 .kind(acp::ToolKind::Think)
@@ -2997,12 +3194,45 @@ async fn process_sse_event(
             outcome_kind,
             outcome_message,
         } => {
+            if native_worker(
+                conn,
+                client_features,
+                session_id,
+                base_url,
+                bearer_token,
+                &handle,
+            )
+            .await
+            {
+                return ConsumeOutcome::Continue;
+            }
             // 1. Send standard ACP ToolCallUpdate so Paseo marks it complete.
-            let mut fields =
-                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed);
+            let mut fields = acp::ToolCallUpdateFields::new()
+                .status(subagent_tool_status(outcome_kind.as_ref()));
+            let mut content = vec![];
             if let Some(summary) = &result_summary {
-                let block: acp::ContentBlock = summary.clone().into();
-                fields = fields.content(vec![acp::ToolCallContent::from(block)]);
+                content.push(acp::ToolCallContent::from(acp::ContentBlock::from(
+                    summary.clone(),
+                )));
+            }
+            let label = match outcome_kind.as_ref() {
+                Some(crate::events::SubagentResultKind::Cancelled) => Some("Worker cancelled."),
+                Some(crate::events::SubagentResultKind::Failure) => Some("Worker failed."),
+                Some(crate::events::SubagentResultKind::Salvaged) => {
+                    Some("Worker result was salvaged; success is unconfirmed.")
+                }
+                None | Some(crate::events::SubagentResultKind::Unknown) => {
+                    Some("Worker outcome is unavailable.")
+                }
+                _ => None,
+            };
+            if let Some(label) = label {
+                content.push(acp::ToolCallContent::from(acp::ContentBlock::from(
+                    format!("{label} {}", outcome_message.as_deref().unwrap_or("")),
+                )));
+            }
+            if !content.is_empty() {
+                fields = fields.content(content);
             }
             let update = acp::ToolCallUpdate::new(handle.clone(), fields);
             let sid = acp::SessionId::new(session_id.to_string());
@@ -5107,6 +5337,33 @@ mod tests {
         assert!(features.supports_system_reminder);
         assert!(features.supports_job_events);
         assert!(features.supports_ask_user_question_overlay);
+    }
+
+    #[test]
+    fn test_native_subagents_require_the_v1_capability() {
+        let caps: acp::ClientCapabilities =
+            serde_json::from_value(serde_json::json!({"subagents":{}})).unwrap();
+        assert!(ClientFeatureSupport::from_initialize(&caps, &None).supports_child_sessions);
+        assert!(
+            !ClientFeatureSupport::from_initialize(&acp::ClientCapabilities::default(), &None)
+                .supports_child_sessions
+        );
+        use crate::events::SubagentResultKind::*;
+        assert_eq!(
+            subagent_tool_status(Some(&Success)),
+            acp::ToolCallStatus::Completed
+        );
+        assert_eq!(
+            subagent_tool_status(Some(&Failure)),
+            acp::ToolCallStatus::Failed
+        );
+        assert_eq!(
+            subagent_tool_status(Some(&Cancelled)),
+            acp::ToolCallStatus::Failed
+        );
+        for unknown in [None, Some(&Unknown), Some(&Salvaged)] {
+            assert_eq!(subagent_tool_status(unknown), acp::ToolCallStatus::Pending);
+        }
     }
 
     #[test]

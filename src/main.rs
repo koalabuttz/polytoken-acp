@@ -5,6 +5,7 @@
 //! Polytoken as an agent without the TUI.
 
 mod agent;
+mod children;
 mod daemon;
 mod events;
 mod history;

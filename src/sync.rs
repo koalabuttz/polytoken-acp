@@ -363,7 +363,9 @@ impl Projection {
                     events.push(json!({"type":"subagent_started","handle":handle,"subagent_type":job["subagent_type"].as_str().unwrap_or("subagent"),"model":job["model"].as_str().unwrap_or("")}));
                 }
                 if matches!(status, "completed" | "failed" | "cancelled") {
-                    let result = match get(base, token, &format!("/job/{id}/result")).await {
+                    let retained = get(base, token, &format!("/job/{id}/result")).await;
+                    let result_available = retained.is_ok();
+                    let result = match retained {
                         Ok(value) => value,
                         Err(error) => {
                             json!({"content":{"text":format!("Result unavailable: {error}")},"is_error":status!="completed"})
@@ -374,8 +376,10 @@ impl Projection {
                         "cancelled"
                     } else if status == "failed" || result["is_error"] == true {
                         "failure"
-                    } else {
+                    } else if result_available {
                         "success"
+                    } else {
+                        "unknown"
                     };
                     events.push(json!({"type":"subagent_completed","handle":handle,"outcome":{"kind":kind},"result_summary":summary}));
                 }
