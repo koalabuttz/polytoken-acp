@@ -24,12 +24,13 @@ All extension methods use the `_polytoken/` vendor namespace.
 
 Sent when the Polytoken daemon emits an `ask_user_question` interrogative event. This is a **request** — it expects a response containing the user's answers. See the [Polytool CLI reference](https://docs.polytoken.dev/reference/cli/) for `polytoken print event-schema`, which prints the full `DaemonEvent` JSON Schema including interrogative shapes.
 
-**When:** The daemon agent calls `ask_user_question` (structured questions with options, modes, etc.). This cannot be mapped to ACP's standard `session/request_permission`, so it uses an extension request instead.
+**When:** The daemon agent calls `ask_user_question` (structured questions with options, modes, etc.) and the client does not advertise native form elicitation. With native support, the shim uses ACP's standard `elicitation/create` instead. This behavior applies to both negotiated ACP versions.
 
 **Params:**
 
 ```json
 {
+  "session_id": "string — the ACP session ID",
   "interrogative_id": "string — the daemon's interrogative ID, needed for the response",
   "questions": [
     {

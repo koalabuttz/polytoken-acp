@@ -8,7 +8,9 @@ mod agent;
 mod daemon;
 mod events;
 mod history;
+mod sync;
 mod tool_output;
+mod wire;
 
 use tracing::info;
 
@@ -54,6 +56,6 @@ fn main() {
         .expect("Failed to create tokio runtime");
 
     runtime.block_on(async {
-        agent::run().await;
+        wire::run().await;
     });
 }

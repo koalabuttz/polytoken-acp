@@ -23,7 +23,7 @@
 //! `compaction_fencepost`, `system_reminder`, `classifier_decision`,
 //! `context_cleared`, `image_reference`.
 
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::v1::schema as acp;
 use tracing::debug;
 
 use crate::events::{extract_locations, tool_call_title_override, tool_kind_for_name};
@@ -125,7 +125,20 @@ pub fn translate_history_to_notifications(
     let mut notifications = Vec::new();
     for item in replay_items {
         let updates = translate_history_item(item);
-        for update in updates {
+        for mut update in updates {
+            if let Some(pid) = item.get("prompt_id").and_then(|p| p.as_str()) {
+                match &mut update {
+                    acp::SessionUpdate::UserMessageChunk(chunk)
+                    | acp::SessionUpdate::AgentMessageChunk(chunk)
+                    | acp::SessionUpdate::AgentThoughtChunk(chunk) => {
+                        chunk
+                            .meta
+                            .get_or_insert_with(Default::default)
+                            .insert("_polytoken_message_id".into(), serde_json::json!(pid));
+                    }
+                    _ => {}
+                }
+            }
             notifications.push(acp::SessionNotification::new(sid.clone(), update));
         }
     }

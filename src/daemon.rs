@@ -12,7 +12,7 @@ use base64::Engine;
 use rand::Rng;
 use serde::Deserialize;
 use tokio::process::{Child, Command};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// How long to wait for the daemon to become ready (polling startup.json).
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -40,11 +40,6 @@ struct StartupJson {
     port: Option<u16>,
     #[serde(default)]
     message: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct PromptAcceptedResponse {
-    prompt_id: String,
 }
 
 /// Subset of the daemon's `GET /state` response (`SessionStateSnapshot`)
@@ -337,29 +332,19 @@ impl DaemonHandle {
 
     /// Send a prompt to the daemon using explicit connection params (no borrow needed).
     pub async fn prompt_with(base_url: &str, bearer_token: &str, content: &str) -> Result<String> {
-        let client = reqwest::Client::new();
-        let url = format!("{}/prompt", base_url);
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", bearer_token))
-            .json(&serde_json::json!({"content": content}))
-            .send()
-            .await
-            .context("Failed to send prompt to daemon")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon /prompt returned status {}: {}", status, body);
-        }
-
-        let body: PromptAcceptedResponse = resp.json().await.context(format!(
-            "Failed to parse prompt response (status {})",
-            status
-        ))?;
-
-        debug!(prompt_id = %body.prompt_id, "Prompt accepted by daemon");
-        Ok(body.prompt_id)
+        let snapshot = crate::sync::snapshot(base_url, bearer_token).await?;
+        let response = crate::sync::mutate(
+            base_url,
+            bearer_token,
+            "/prompt",
+            serde_json::json!({"content":content}),
+            &snapshot,
+        )
+        .await?;
+        Ok(response["prompt_id"]
+            .as_str()
+            .context("Prompt response has no id")?
+            .to_string())
     }
 
     /// Send a prompt to the daemon. Returns the prompt_id.
@@ -371,16 +356,9 @@ impl DaemonHandle {
     /// Cancel the current turn.
     #[allow(dead_code)]
     pub async fn cancel_turn(&self) -> Result<()> {
-        let client = reqwest::Client::new();
-        let url = format!("{}/turn/cancel", self.base_url);
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bearer_token))
-            .send()
-            .await
-            .context("Failed to cancel turn")?;
-        if !resp.status().is_success() {
-            bail!("Cancel turn failed with status: {}", resp.status());
+        let snapshot = crate::sync::snapshot(&self.base_url, &self.bearer_token).await?;
+        if snapshot["turn"]["prompt_id"].is_string() {
+            crate::sync::mutate(&self.base_url,&self.bearer_token,"/turn/cancel",serde_json::json!({"prompt_id":snapshot["turn"]["prompt_id"],"generation":snapshot["turn"]["generation"]}),&snapshot).await?;
         }
         Ok(())
     }
@@ -388,22 +366,13 @@ impl DaemonHandle {
     /// Respond to an interrogative (permission request).
     #[allow(dead_code)]
     pub async fn respond_interrogative(&self, interrogative_id: &str, granted: bool) -> Result<()> {
-        let client = reqwest::Client::new();
-        let url = format!(
-            "{}/interrogative/{}/respond",
-            self.base_url, interrogative_id
-        );
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bearer_token))
-            .json(&serde_json::json!({"kind": "permission_answer", "granted": granted}))
-            .send()
-            .await
-            .context("Failed to respond to interrogative")?;
-        if !resp.status().is_success() {
-            warn!(status = %resp.status(), "Interrogative response failed");
-        }
-        Ok(())
+        crate::sync::respond(
+            &self.base_url,
+            &self.bearer_token,
+            interrogative_id,
+            serde_json::json!({"kind":"permission_answer","granted":granted}),
+        )
+        .await
     }
 
     /// Check daemon health by GET /health. Returns the HTTP status code.
@@ -422,20 +391,8 @@ impl DaemonHandle {
     /// Fetch the daemon's session state snapshot (the subset we need).
     #[allow(dead_code)]
     pub async fn fetch_session_state(&self) -> Result<SessionStateSnapshot> {
-        let client = reqwest::Client::new();
-        let url = format!("{}/state", self.base_url);
-        let resp = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.bearer_token))
-            .send()
-            .await
-            .context("Failed to GET /state")?;
-        if !resp.status().is_success() {
-            bail!("GET /state returned status {}", resp.status());
-        }
-        resp.json::<SessionStateSnapshot>()
-            .await
-            .context("Failed to parse /state response")
+        serde_json::from_value(crate::sync::state(&self.base_url, &self.bearer_token).await?)
+            .context("Invalid model state")
     }
 
     /// Switch the active model by POSTing to `/model`.
@@ -507,20 +464,7 @@ impl DaemonHandle {
 
     /// Fetch the full daemon state snapshot.
     pub async fn fetch_daemon_state(&self) -> Result<serde_json::Value> {
-        let client = reqwest::Client::new();
-        let url = format!("{}/state", self.base_url);
-        let resp = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.bearer_token))
-            .send()
-            .await
-            .context("Failed to GET /state")?;
-        if !resp.status().is_success() {
-            bail!("GET /state returned status {}", resp.status());
-        }
-        resp.json::<serde_json::Value>()
-            .await
-            .context("Failed to parse /state response")
+        crate::sync::state(&self.base_url, &self.bearer_token).await
     }
 
     /// Terminate the daemon gracefully.

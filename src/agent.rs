@@ -1,6 +1,6 @@
 //! ACP Agent implementation for the polytoken daemon shim.
 //!
-//! In ACP 1.x, the agent is built using a builder pattern with
+//! The shared ACP v1 session engine uses the SDK's builder pattern with
 //! `on_receive_request` / `on_receive_notification` handlers rather than
 //! implementing a trait. The shared session state (daemon handles) lives in
 //! an `Arc<Mutex<>>` captured by each handler closure.
@@ -9,11 +9,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1 as acp;
-use agent_client_protocol::{
-    Agent, Client, ConnectionTo, Stdio, on_receive_notification, on_receive_request,
-};
-use anyhow::{Context, bail};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema as acp;
+use agent_client_protocol::{Agent, Client, on_receive_notification, on_receive_request};
 use tracing::{debug, error, info, warn};
 
 use tokio_util::sync::CancellationToken;
@@ -23,6 +21,8 @@ use crate::events::{
     self, AskUserQuestionPayload, EventTranslation, GoalProposalContext, PlanHandoffContext,
 };
 use crate::history;
+
+type CancelTarget = Arc<Mutex<Option<serde_json::Value>>>;
 
 /// Shared state across all ACP handlers for one connection.
 struct AgentState {
@@ -36,6 +36,7 @@ struct AgentState {
     /// `handle_cancel` triggers these to proactively unblock the `SseConsumer`
     /// even when the daemon never emits a `TurnCancelled` SSE event.
     cancel_tokens: HashMap<String, CancellationToken>,
+    cancel_targets: HashMap<String, CancelTarget>,
     /// Client feature support captured from the ACP `initialize` handshake.
     /// `None` until `initialize` is received; `Some(features)` after.
     /// Tracks which `_polytoken/*` ext methods/notifications the client
@@ -56,7 +57,7 @@ struct AgentState {
 /// fallbacks. Clients that want precise control advertise their support.
 #[derive(Clone, Debug)]
 struct ClientFeatureSupport {
-    /// Whether the client can render a `session/elicitation` form
+    /// Whether the client can render an `elicitation/create` form
     /// (single-select enum, multi-select, etc.).
     supports_elicitation: bool,
     /// Whether the client handles `_polytoken/subagent_started` and
@@ -136,7 +137,7 @@ struct PromptQueueItem {
     bearer_token: String,
     base_url: String,
     cwd: std::path::PathBuf,
-    responder: agent_client_protocol::Responder<acp::PromptResponse>,
+    responder: agent_client_protocol::v1::Responder<acp::PromptResponse>,
     conn: ConnectionTo<Client>,
     /// Client feature support captured from the `initialize` handshake.
     client_features: ClientFeatureSupport,
@@ -148,6 +149,7 @@ impl AgentState {
             sessions: HashMap::new(),
             prompt_queues: HashMap::new(),
             cancel_tokens: HashMap::new(),
+            cancel_targets: HashMap::new(),
             client_features: None,
         }
     }
@@ -159,6 +161,7 @@ impl AgentState {
         self.prompt_queues.clear();
         // Cancel any in-flight turns.
         self.cancel_tokens.clear();
+        self.cancel_targets.clear();
         let daemons: Vec<(String, DaemonHandle)> = self.sessions.drain().collect();
         for (_, mut daemon) in daemons {
             daemon.terminate().await;
@@ -167,11 +170,11 @@ impl AgentState {
 }
 
 /// Entry point: build the agent, wire up handlers, and run over stdio.
-pub async fn run() {
+pub async fn run(transport: impl agent_client_protocol::ConnectTo<Agent>) {
     let state = Arc::new(Mutex::new(AgentState::new()));
 
     let result = Agent
-        .builder()
+        .v1()
         .name("polytoken")
         // initialize
         .on_receive_request(
@@ -328,7 +331,7 @@ pub async fn run() {
         // The SDK rejects unknown requests and routes client responses to their
         // awaiting handlers. A catch-all dispatch handler would also intercept
         // successful permission and extension responses and replace them with errors.
-        .connect_to(Stdio::new())
+        .connect_to(transport)
         .await;
 
     match &result {
@@ -344,6 +347,67 @@ pub async fn run() {
     info!("polytoken-acp shutting down");
 }
 
+fn setup_meta(cwd: &Path, state: &Result<serde_json::Value, anyhow::Error>) -> acp::Meta {
+    let mut commands = build_available_commands(cwd).unwrap_or_default();
+    commands.extend(build_skill_commands(state));
+    let foreground = state
+        .as_ref()
+        .ok()
+        .and_then(|s| s["_foreground"].as_str())
+        .unwrap_or("unknown");
+    let mut meta = acp::Meta::new();
+    meta.insert(
+        "_polytoken_available_commands".into(),
+        serde_json::json!(commands),
+    );
+    meta.insert(
+        "_polytoken_foreground".into(),
+        serde_json::json!(foreground),
+    );
+    meta
+}
+
+async fn resync_active(
+    state: &Arc<Mutex<AgentState>>,
+    sid: &str,
+    cwd: &Path,
+    conn: &ConnectionTo<Client>,
+    replay: bool,
+) -> anyhow::Result<
+    Option<(
+        Vec<acp::SessionConfigOption>,
+        Option<acp::SessionModeState>,
+        acp::Meta,
+    )>,
+> {
+    let info = state
+        .lock()
+        .unwrap()
+        .sessions
+        .get(sid)
+        .map(|d| (d.base_url().to_string(), d.bearer_token().to_string()));
+    let Some((base, token)) = info else {
+        return Ok(None);
+    };
+    let raw = crate::sync::state(&base, &token).await?;
+    let pm = fetch_permission_monitor_raw(&base, &token)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Permission monitor unavailable"))?;
+    let modes = build_session_mode_from_permission_monitor(&Ok(pm.clone()));
+    let data = Ok(raw);
+    if replay {
+        let items = fetch_history_raw(&base, &token).await?;
+        for notification in history::translate_history_to_notifications(&items, sid) {
+            conn.send_notification(notification)?;
+        }
+    }
+    Ok(Some((
+        build_config_options(&data, &modes, &Ok(pm)),
+        modes,
+        setup_meta(cwd, &data),
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // Request handlers
 // ---------------------------------------------------------------------------
@@ -351,7 +415,7 @@ pub async fn run() {
 async fn handle_new_session(
     state: &Arc<Mutex<AgentState>>,
     req: acp::NewSessionRequest,
-    responder: agent_client_protocol::Responder<acp::NewSessionResponse>,
+    responder: agent_client_protocol::v1::Responder<acp::NewSessionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     info!(cwd = ?req.cwd, "ACP new_session");
@@ -387,7 +451,15 @@ async fn handle_new_session(
             let session_id = daemon.session_id().to_string();
 
             // Fetch daemon state once, then build modes and config options from it.
-            let daemon_state = daemon.fetch_daemon_state().await;
+            let daemon_state = match daemon.fetch_daemon_state().await {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    daemon.terminate().await;
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::internal_error().data(error.to_string()),
+                    );
+                }
+            };
             let permission_monitor = match fetch_permission_monitor_raw(
                 daemon.base_url(),
                 daemon.bearer_token(),
@@ -430,6 +502,7 @@ async fn handle_new_session(
             if !config_options.is_empty() {
                 response = response.config_options(config_options);
             }
+            let response = response.meta(setup_meta(&req.cwd, &daemon_state));
             let respond_result = responder.respond(response);
 
             // Now send notifications — the client has the session ID from the
@@ -499,10 +572,35 @@ async fn handle_new_session(
 async fn handle_resume_session(
     state: &Arc<Mutex<AgentState>>,
     req: acp::ResumeSessionRequest,
-    responder: agent_client_protocol::Responder<acp::ResumeSessionResponse>,
+    responder: agent_client_protocol::v1::Responder<acp::ResumeSessionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
+    if req
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("_polytoken_resync"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        match resync_active(state, &session_id, &req.cwd, &cx, false).await {
+            Ok(Some((options, modes, meta))) => {
+                let mut response = acp::ResumeSessionResponse::new()
+                    .config_options(options)
+                    .meta(meta);
+                if let Some(modes) = modes {
+                    response = response.modes(modes);
+                }
+                return responder.respond(response);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return responder.respond_with_error(
+                    agent_client_protocol::Error::internal_error().data(error.to_string()),
+                );
+            }
+        }
+    }
 
     info!(
         session_id = %session_id,
@@ -555,7 +653,15 @@ async fn handle_resume_session(
     .await
     {
         Ok(mut daemon) => {
-            let daemon_state = daemon.fetch_daemon_state().await;
+            let daemon_state = match daemon.fetch_daemon_state().await {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    daemon.terminate().await;
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::internal_error().data(error.to_string()),
+                    );
+                }
+            };
             let permission_monitor = match fetch_permission_monitor_raw(
                 daemon.base_url(),
                 daemon.bearer_token(),
@@ -643,6 +749,7 @@ async fn handle_resume_session(
             if !config_options.is_empty() {
                 response = response.config_options(config_options);
             }
+            let response = response.meta(setup_meta(&req.cwd, &daemon_state));
             let respond_result = responder.respond(response);
 
             // Send session_info_update with the title from the daemon state.
@@ -722,10 +829,35 @@ async fn handle_resume_session(
 async fn handle_load_session(
     state: &Arc<Mutex<AgentState>>,
     req: acp::LoadSessionRequest,
-    responder: agent_client_protocol::Responder<acp::LoadSessionResponse>,
+    responder: agent_client_protocol::v1::Responder<acp::LoadSessionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
+    if req
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("_polytoken_resync"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        match resync_active(state, &session_id, &req.cwd, &cx, true).await {
+            Ok(Some((options, modes, meta))) => {
+                let mut response = acp::LoadSessionResponse::new()
+                    .config_options(options)
+                    .meta(meta);
+                if let Some(modes) = modes {
+                    response = response.modes(modes);
+                }
+                return responder.respond(response);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return responder.respond_with_error(
+                    agent_client_protocol::Error::internal_error().data(error.to_string()),
+                );
+            }
+        }
+    }
 
     info!(session_id = %session_id, cwd = ?req.cwd, "ACP session/load");
 
@@ -774,7 +906,15 @@ async fn handle_load_session(
     .await
     {
         Ok(mut daemon) => {
-            let daemon_state = daemon.fetch_daemon_state().await;
+            let daemon_state = match daemon.fetch_daemon_state().await {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    daemon.terminate().await;
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::internal_error().data(error.to_string()),
+                    );
+                }
+            };
             let permission_monitor = match fetch_permission_monitor_raw(
                 daemon.base_url(),
                 daemon.bearer_token(),
@@ -891,7 +1031,7 @@ async fn handle_load_session(
             if !config_options.is_empty() {
                 response = response.config_options(config_options);
             }
-            responder.respond(response)
+            responder.respond(response.meta(setup_meta(&req.cwd, &daemon_state)))
         }
         Err(e) => {
             error!(error = %e, session_id = %session_id, "Failed to load session");
@@ -908,7 +1048,7 @@ async fn handle_load_session(
 async fn handle_close_session(
     state: &Arc<Mutex<AgentState>>,
     req: acp::CloseSessionRequest,
-    responder: agent_client_protocol::Responder<acp::CloseSessionResponse>,
+    responder: agent_client_protocol::v1::Responder<acp::CloseSessionResponse>,
     _cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
@@ -921,6 +1061,7 @@ async fn handle_close_session(
         let mut sessions = state.lock().unwrap();
         sessions.prompt_queues.remove(&session_id);
         sessions.cancel_tokens.remove(&session_id);
+        sessions.cancel_targets.remove(&session_id);
         sessions.sessions.remove(&session_id)
     };
 
@@ -940,7 +1081,7 @@ async fn handle_close_session(
 async fn handle_prompt(
     state: &Arc<Mutex<AgentState>>,
     req: acp::PromptRequest,
-    responder: agent_client_protocol::Responder<acp::PromptResponse>,
+    responder: agent_client_protocol::v1::Responder<acp::PromptResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
@@ -1069,17 +1210,22 @@ fn spawn_prompt_processor(
             // Register a cancel token for this in-flight turn so that
             // `handle_cancel` can proactively terminate the SseConsumer.
             let cancel_token = CancellationToken::new();
+            let cancel_target = Arc::new(Mutex::new(None));
             {
                 let mut s = state.lock().unwrap();
                 s.cancel_tokens
                     .insert(session_id.clone(), cancel_token.clone());
+                s.cancel_targets
+                    .insert(session_id.clone(), cancel_target.clone());
             }
 
-            run_prompt_turn(item, cancel_token).await;
+            run_prompt_turn(item, cancel_token, cancel_target).await;
 
             // Clean up the cancel token (harmless no-op if handle_cancel
             // already removed and triggered it).
-            state.lock().unwrap().cancel_tokens.remove(&session_id);
+            let mut s = state.lock().unwrap();
+            s.cancel_tokens.remove(&session_id);
+            s.cancel_targets.remove(&session_id);
         }
         // Channel closed — all senders dropped (session closed).
         Ok(())
@@ -1090,26 +1236,62 @@ fn spawn_prompt_processor(
 
 /// Execute a single prompt turn: send the prompt to the daemon, then run the
 /// SSE consumer to completion. Called by the per-session processor task.
-async fn run_prompt_turn(item: PromptQueueItem, cancel_token: CancellationToken) {
-    let prompt_id = match DaemonHandle::prompt_with(
-        &item.base_url,
-        &item.bearer_token,
-        &item.prompt_text,
-    )
-    .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            error!(error = %e, "Failed to send prompt to daemon");
+async fn run_prompt_turn(
+    item: PromptQueueItem,
+    cancel_token: CancellationToken,
+    target: CancelTarget,
+) {
+    let snapshot = match crate::sync::snapshot(&item.base_url, &item.bearer_token).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
             let _ = item.responder.respond_with_error(
-                agent_client_protocol::Error::internal_error().data(serde_json::json!({
-                    "error": "Failed to forward prompt to daemon",
-                    "detail": e.to_string(),
-                })),
+                agent_client_protocol::Error::internal_error().data(error.to_string()),
             );
             return;
         }
     };
+    if cancel_token.is_cancelled() {
+        let _ = item
+            .responder
+            .respond(acp::PromptResponse::new(acp::StopReason::Cancelled));
+        return;
+    }
+    let accepted = crate::sync::mutate(
+        &item.base_url,
+        &item.bearer_token,
+        "/prompt",
+        serde_json::json!({"content":item.prompt_text}),
+        &snapshot,
+    )
+    .await;
+    let prompt_id = match accepted {
+        Ok(value) if value["prompt_id"].is_string() => {
+            value["prompt_id"].as_str().unwrap().to_string()
+        }
+        result => {
+            let detail = match result {
+                Ok(_) => {
+                    "Daemon queued the prompt behind other work; it cannot be attributed safely"
+                        .to_string()
+                }
+                Err(error) => error.to_string(),
+            };
+            let _ = item
+                .responder
+                .respond_with_error(agent_client_protocol::Error::internal_error().data(detail));
+            return;
+        }
+    };
+    *target.lock().unwrap() =
+        Some(serde_json::json!({"prompt_id":prompt_id,"epoch":snapshot["daemon_epoch"]}));
+    // Internal frontend signal: ACP v2 acknowledges insertion independently of completion.
+    send_ext_notification(
+        &item.conn,
+        "_polytoken/prompt_accepted",
+        &serde_json::json!({
+            "session_id":item.session_id,"prompt_id":prompt_id,"content":item.prompt_text,
+        }),
+    );
 
     info!(
         session_id = %item.session_id,
@@ -1117,9 +1299,20 @@ async fn run_prompt_turn(item: PromptQueueItem, cancel_token: CancellationToken)
         "Prompt forwarded to daemon"
     );
 
+    if cancel_token.is_cancelled() {
+        let _ = crate::sync::mutate(
+            &item.base_url,
+            &item.bearer_token,
+            "/turn/cancel",
+            serde_json::json!({"prompt_id":prompt_id}),
+            &snapshot,
+        )
+        .await;
+    }
     let consumer = SseConsumer {
         conn: item.conn,
         session_id: item.session_id,
+        projection: crate::sync::Projection::new(snapshot, prompt_id.clone()),
         prompt_id,
         events_url: item.events_url,
         bearer_token: item.bearer_token,
@@ -1152,7 +1345,7 @@ async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotifi
     // Since we can't hold the lock across await, we clone the necessary bits.
     // We also grab the per-session cancel token so we can proactively unblock
     // the SseConsumer even when the daemon never emits a TurnCancelled event.
-    let (daemon_info, cancel_token) = {
+    let (daemon_info, cancel_token, cancel_target) = {
         let mut sessions = state.lock().unwrap();
         let info = sessions.sessions.get(&session_id).map(|daemon| {
             (
@@ -1161,7 +1354,8 @@ async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotifi
             )
         });
         let token = sessions.cancel_tokens.remove(&session_id);
-        (info, token)
+        let target = sessions.cancel_targets.remove(&session_id);
+        (info, token, target)
     };
 
     // Trigger the local cancel token first so the responder is freed
@@ -1173,13 +1367,26 @@ async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotifi
 
     // Cancel via HTTP directly (no lock needed)
     if let Some((base_url, bearer)) = daemon_info {
-        let client = reqwest::Client::new();
-        let url = format!("{}/turn/cancel", base_url);
-        let _ = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", bearer))
-            .send()
-            .await;
+        match crate::sync::snapshot(&base_url, &bearer).await {
+            Ok(snapshot) => {
+                let target = cancel_target
+                    .as_ref()
+                    .and_then(|t| t.lock().unwrap().clone());
+                let Some(target) = target else { return };
+                if snapshot["daemon_epoch"] != target["epoch"]
+                    || snapshot["turn"]["prompt_id"] != target["prompt_id"]
+                {
+                    return;
+                }
+                let body = serde_json::json!({"prompt_id":target["prompt_id"],"generation":snapshot["turn"]["generation"]});
+                if let Err(error) =
+                    crate::sync::mutate(&base_url, &bearer, "/turn/cancel", body, &snapshot).await
+                {
+                    warn!(%error, "Targeted cancellation failed");
+                }
+            }
+            Err(error) => warn!(%error, "Unable to synchronize cancellation target"),
+        }
     }
 }
 
@@ -1907,7 +2114,7 @@ fn write_mcp_servers_config(mcp_servers: &[acp::McpServer], temp_dir: &Path) -> 
 async fn handle_list_sessions(
     state: &Arc<Mutex<AgentState>>,
     _req: acp::ListSessionsRequest,
-    responder: agent_client_protocol::Responder<acp::ListSessionsResponse>,
+    responder: agent_client_protocol::v1::Responder<acp::ListSessionsResponse>,
     _cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let sessions = state.lock().unwrap();
@@ -1922,7 +2129,7 @@ async fn handle_list_sessions(
 async fn handle_set_session_mode(
     state: &Arc<Mutex<AgentState>>,
     req: acp::SetSessionModeRequest,
-    responder: agent_client_protocol::Responder<acp::SetSessionModeResponse>,
+    responder: agent_client_protocol::v1::Responder<acp::SetSessionModeResponse>,
     _cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
@@ -2010,7 +2217,7 @@ async fn rebuild_config_options(base_url: &str, bearer: &str) -> Vec<acp::Sessio
 async fn handle_set_session_config_option(
     state: &Arc<Mutex<AgentState>>,
     req: acp::SetSessionConfigOptionRequest,
-    responder: agent_client_protocol::Responder<acp::SetSessionConfigOptionResponse>,
+    responder: agent_client_protocol::v1::Responder<acp::SetSessionConfigOptionResponse>,
     _cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
@@ -2067,17 +2274,7 @@ async fn handle_set_session_config_option(
             // The daemon encodes effort in model names: zai/glm-5.2(high)
             // We need to fetch /state to get the active model name, then
             // append the effort level.
-            let client = reqwest::Client::new();
-            let state_resp = client
-                .get(format!("{}/state", base_url))
-                .header("Authorization", format!("Bearer {}", bearer))
-                .send()
-                .await;
-
-            let daemon_state = match state_resp {
-                Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
-                _ => None,
-            };
+            let daemon_state = crate::sync::state(&base_url, &bearer).await.ok();
             let payload = match daemon_state
                 .as_ref()
                 .and_then(|state| build_reasoning_request(state, &value))
@@ -2149,6 +2346,7 @@ async fn handle_set_session_config_option(
 
 /// The SSE consumer task that bridges daemon events to ACP notifications.
 struct SseConsumer {
+    projection: crate::sync::Projection,
     conn: ConnectionTo<Client>,
     session_id: String,
     prompt_id: String,
@@ -2156,7 +2354,7 @@ struct SseConsumer {
     bearer_token: String,
     base_url: String,
     cwd: std::path::PathBuf,
-    responder: agent_client_protocol::Responder<acp::PromptResponse>,
+    responder: agent_client_protocol::v1::Responder<acp::PromptResponse>,
     /// Client feature support captured from the `initialize` handshake.
     /// Determines which ext methods/notifications to send and which to
     /// skip or fall back to standard ACP equivalents.
@@ -2180,6 +2378,7 @@ impl SseConsumer {
         let cwd = self.cwd;
         let client_features = self.client_features;
         let mut responder = Some(self.responder);
+        let mut projection = self.projection;
 
         loop {
             // Race the SSE consumer against the cancel token. When the daemon
@@ -2197,6 +2396,7 @@ impl SseConsumer {
                     &cwd,
                     &conn,
                     &client_features,
+                    &mut projection,
                 ) => result,
                 _ = cancel_token.cancelled() => {
                     info!(
@@ -2303,23 +2503,29 @@ async fn connect_and_consume(
     cwd: &std::path::Path,
     conn: &ConnectionTo<Client>,
     client_features: &ClientFeatureSupport,
+    projection: &mut crate::sync::Projection,
 ) -> ConsumeOutcome {
-    let client = reqwest::Client::new();
-    let response = client
+    let response = reqwest::Client::new()
         .get(events_url)
-        .header("Authorization", format!("Bearer {}", bearer_token))
+        .query(&[(
+            "after",
+            projection.snapshot["cursor"].as_str().unwrap_or(""),
+        )])
+        .bearer_auth(bearer_token)
         .header("Accept", "text/event-stream")
         .send()
         .await;
-
     let response = match response {
         Ok(r) if r.status().is_success() => r,
+        Ok(r) if matches!(r.status().as_u16(), 400 | 409 | 410) => {
+            return reset_projection(projection, base_url, bearer_token).await;
+        }
         Ok(r) => {
-            error!(status = %r.status(), "SSE connection returned non-200");
+            error!(status = %r.status(), "Ordered event stream rejected");
             return ConsumeOutcome::Error;
         }
-        Err(e) => {
-            error!(error = %e, "SSE connection failed");
+        Err(error) => {
+            error!(%error, "Ordered event stream failed");
             return ConsumeOutcome::Error;
         }
     };
@@ -2344,30 +2550,112 @@ async fn connect_and_consume(
 
         let data_lines = parser.feed(&chunk);
         for data in data_lines {
-            match process_sse_event(
-                &data,
-                prompt_id,
-                session_id,
-                base_url,
-                bearer_token,
-                cwd,
-                &mut cached_facets,
-                conn,
-                client_features,
-            )
-            .await
-            {
-                ConsumeOutcome::Done(reason) => return ConsumeOutcome::Done(reason),
-                ConsumeOutcome::Error => return ConsumeOutcome::Error,
-                ConsumeOutcome::Fatal(message) => return ConsumeOutcome::Fatal(message),
-                ConsumeOutcome::Continue => {}
+            let (revision, record) = match projection.pending_record(&data, session_id) {
+                Ok(Some(pair)) => pair,
+                Ok(None) => continue,
+                Err(error) => return ConsumeOutcome::Fatal(error.to_string()),
+            };
+            if record["type"] == "reset_required" || record["type"] == "epoch_started" {
+                return reset_projection(projection, base_url, bearer_token).await;
             }
+            if record["type"] == "history_rewritten" {
+                return ConsumeOutcome::Fatal(
+                    "Daemon history was rewritten; reload this session before submitting more work"
+                        .into(),
+                );
+            }
+            let mut translated = projection.record_events(&record);
+            if record["type"] == "history_appended"
+                || record["type"] == "turn_completed"
+                || record["type"] == "turn_failed"
+            {
+                match projection
+                    .history_events(base_url, bearer_token, record["type"] != "history_appended")
+                    .await
+                {
+                    Ok(events) => translated.splice(0..0, events).for_each(drop),
+                    Err(error) => return ConsumeOutcome::Fatal(error.to_string()),
+                }
+            }
+            if record["type"] == "jobs_changed" || record["type"] == "subagent_changed" {
+                match projection.job_events(base_url, bearer_token).await {
+                    Ok(events) => translated.extend(events),
+                    Err(error) => return ConsumeOutcome::Fatal(error.to_string()),
+                }
+            }
+            if record["type"] == "interrogative_registered" {
+                let id = record["interrogative_id"].as_str().unwrap_or("");
+                if !projection.handled_questions.contains(id) {
+                    // The public preview does not yet carry structured answer payloads.
+                    // Read only pending interrogatives from /state, never transcript data.
+                    match crate::sync::get(base_url, bearer_token, "/state").await {
+                        Ok(state) => {
+                            if let Some(event) = state["pending_interrogatives"]
+                                .as_array()
+                                .and_then(|list| list.iter().find(|e| e["interrogative_id"] == id))
+                            {
+                                let mut event = event.clone();
+                                event["prompt_id"] = serde_json::json!(prompt_id);
+                                translated.push(event);
+                                projection.handled_questions.insert(id.to_string());
+                            }
+                        }
+                        Err(error) => return ConsumeOutcome::Fatal(error.to_string()),
+                    }
+                }
+            }
+            for event in translated {
+                match process_sse_event(
+                    &event.to_string(),
+                    prompt_id,
+                    session_id,
+                    base_url,
+                    bearer_token,
+                    cwd,
+                    &mut cached_facets,
+                    conn,
+                    client_features,
+                )
+                .await
+                {
+                    ConsumeOutcome::Continue => {}
+                    outcome => return outcome,
+                }
+            }
+            // Advance only after every side effect of this ordered record was applied.
+            projection.seen.insert(revision);
         }
     }
 
     // Stream ended without message_complete
     warn!(prompt_id = %prompt_id, "SSE stream ended without explicit turn end");
     ConsumeOutcome::Error
+}
+
+async fn reset_projection(
+    projection: &mut crate::sync::Projection,
+    base: &str,
+    bearer: &str,
+) -> ConsumeOutcome {
+    match crate::sync::snapshot(base, bearer).await {
+        Ok(snapshot) => {
+            if snapshot["daemon_epoch"] != projection.snapshot["daemon_epoch"] {
+                return ConsumeOutcome::Fatal(
+                    "Daemon restarted; reload this session before submitting more work".into(),
+                );
+            }
+            if snapshot["turn"]["prompt_id"] != projection.prompt_id {
+                return ConsumeOutcome::Fatal(
+                    "Sync reset after the turn ended; reload history to inspect its outcome".into(),
+                );
+            }
+            projection.recovering = true;
+            projection.snapshot = snapshot;
+            projection.seen.clear();
+            ConsumeOutcome::Continue
+        }
+        Err(error) => ConsumeOutcome::Fatal(error.to_string()),
+    }
 }
 
 /// Process a single SSE event and translate it into ACP actions.
@@ -2421,7 +2709,17 @@ async fn process_sse_event(
             }
             ConsumeOutcome::Continue
         }
-        EventTranslation::Update(update) => {
+        EventTranslation::Update(mut update) => {
+            match &mut update {
+                acp::SessionUpdate::AgentMessageChunk(chunk)
+                | acp::SessionUpdate::AgentThoughtChunk(chunk) => {
+                    chunk
+                        .meta
+                        .get_or_insert_with(Default::default)
+                        .insert("_polytoken_message_id".into(), serde_json::json!(prompt_id));
+                }
+                _ => {}
+            }
             let update_name = events::session_update_name(&update);
             tracing::debug!(
                 target: "polytoken_acp::conv",
@@ -2506,6 +2804,7 @@ async fn process_sse_event(
         } => {
             handle_plan_handoff(
                 conn,
+                session_id,
                 &interrogative_id,
                 &question,
                 &context,
@@ -2895,10 +3194,10 @@ fn send_ext_notification(conn: &ConnectionTo<Client>, method: &str, params: &ser
             return;
         }
     };
-    let ext_notif = acp::AgentRequest::ExtMethodRequest(acp::ExtRequest::new(method, raw));
+    let ext_notif = acp::AgentNotification::ExtNotification(acp::ExtNotification::new(method, raw));
     // Extension notifications are fire-and-forget. If the client doesn't
     // recognize the method it silently ignores it (per the ACP spec).
-    let _ = conn.send_request(ext_notif);
+    let _ = conn.send_notification(ext_notif);
 }
 
 /// Map a single Polytoken `ask_user_question` item to an ACP elicitation
@@ -2939,7 +3238,7 @@ fn build_elicitation_schema_for_question(
     }
 }
 
-/// Send `ask_user_question` as a native ACP `session/elicitation` request.
+/// Send `ask_user_question` as a native ACP `elicitation/create` request.
 /// The client renders a form with clickable options (when supported) and
 /// returns the selected values. If the user declines or cancels, the
 /// interrogative is cancelled on the daemon.
@@ -3155,7 +3454,7 @@ fn elicitation_content_to_answers(
 /// before the interrogative is cancelled.
 ///
 /// If the client advertised form-based elicitation support during the ACP
-/// `initialize` handshake, a native `session/elicitation` request is sent
+/// `initialize` handshake, a native `elicitation/create` request is sent
 /// instead (clickable form with single-select enum options).
 async fn handle_ask_user_question(
     conn: &ConnectionTo<Client>,
@@ -3182,7 +3481,7 @@ async fn handle_ask_user_question(
     );
 
     // If the client advertised form-based elicitation support during
-    // initialize, use the standardized `session/elicitation` request.
+    // initialize, use the standardized `elicitation/create` request.
     // This renders as a proper form with clickable options (single-select
     // enum / multi-select) in capable clients — better UX than text.
     if client_features.supports_elicitation {
@@ -3215,6 +3514,7 @@ async fn handle_ask_user_question(
     }
 
     let request_json = serde_json::json!({
+        "session_id": session_id,
         "interrogative_id": interrogative_id,
         "questions": payload.questions,
     });
@@ -3295,6 +3595,7 @@ async fn handle_ask_user_question(
 /// option ID is mapped to the daemon's `plan_handoff_answer` decision.
 async fn handle_plan_handoff(
     conn: &ConnectionTo<Client>,
+    session_id: &str,
     interrogative_id: &str,
     question: &str,
     context: &PlanHandoffContext,
@@ -3316,6 +3617,7 @@ async fn handle_plan_handoff(
 
     let payload = events::build_plan_handoff_payload(question, context);
     let request_json = serde_json::json!({
+        "session_id": session_id,
         "interrogative_id": interrogative_id,
         "questions": payload.questions,
     });
@@ -3383,7 +3685,7 @@ async fn handle_plan_handoff(
 /// `goal_proposal_answer`.
 ///
 /// Mirrors the layered strategy from `handle_ask_user_question` (PR #58):
-/// 1. **Prefer native `session/elicitation`** when the client advertised
+/// 1. **Prefer native `elicitation/create`** when the client advertised
 ///    form support — renders a clickable form in Paseo.
 /// 2. **Fall back to the `_polytoken/ask_user_question` ext method** when
 ///    elicitation is unavailable, with a text fallback on failure so the
@@ -3414,7 +3716,7 @@ async fn handle_goal_proposal(
 
     let payload = events::build_goal_proposal_payload(question, context);
 
-    // --- Strategy 1: native session/elicitation (Paseo-compatible) -----------
+    // --- Strategy 1: native elicitation/create (Paseo-compatible) -----------
     if client_features.supports_elicitation {
         handle_goal_proposal_elicitation(
             conn,
@@ -3430,6 +3732,7 @@ async fn handle_goal_proposal(
 
     // --- Strategy 2: ext-method with text fallback -------------------------
     let request_json = serde_json::json!({
+        "session_id": session_id,
         "interrogative_id": interrogative_id,
         "questions": payload.questions,
     });
@@ -3499,7 +3802,7 @@ async fn handle_goal_proposal(
     .expect("on_receiving_result failed");
 }
 
-/// Send a goal proposal as a native ACP `session/elicitation` request. The
+/// Send a goal proposal as a native ACP `elicitation/create` request. The
 /// client renders a clickable form; the selected value is mapped to the
 /// daemon's `goal_proposal_answer`. On decline/cancel/error, a text fallback
 /// is shown before cancelling the interrogative.
@@ -3645,19 +3948,7 @@ fn parse_plan_handoff_answer(value: &serde_json::Value) -> (Option<String>, Opti
 ///
 /// Used by TodoStateChange to re-fetch todos and build an updated Plan.
 async fn fetch_daemon_state_raw(base_url: &str, bearer_token: &str) -> Option<serde_json::Value> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/state", base_url);
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", bearer_token))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        warn!(status = %resp.status(), "Failed to fetch /state for todo plan");
-        return None;
-    }
-    resp.json::<serde_json::Value>().await.ok()
+    crate::sync::state(base_url, bearer_token).await.ok()
 }
 
 /// Fetch the daemon's `/permission-monitor` as raw JSON.
@@ -3682,21 +3973,8 @@ async fn fetch_permission_monitor_raw(
 
 /// Fetch context usage from the daemon's `/state` endpoint and convert to ACP `UsageUpdate`.
 async fn fetch_context_usage(base_url: &str, bearer_token: &str) -> Option<acp::UsageUpdate> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/state", base_url);
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", bearer_token))
-        .send()
-        .await
-        .ok()?;
-
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    let state: serde_json::Value = resp.json().await.ok()?;
-    let usage = state.get("context_usage")?;
+    let snapshot = crate::sync::snapshot(base_url, bearer_token).await.ok()?;
+    let usage = &snapshot["context"]["usage"];
 
     let used = usage
         .get("used_tokens")
@@ -3723,24 +4001,11 @@ async fn fetch_history_raw(
     base_url: &str,
     bearer_token: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/history", base_url);
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", bearer_token))
-        .send()
-        .await
-        .context("Failed to GET /history")?;
-    if !resp.status().is_success() {
-        bail!("GET /history returned status {}", resp.status());
-    }
-    let snapshot: serde_json::Value = resp.json().await.context("Failed to parse /history")?;
-    let items = snapshot
-        .get("items")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    Ok(items)
+    Ok(crate::sync::history(base_url, bearer_token)
+        .await?
+        .iter()
+        .flat_map(crate::sync::normalize)
+        .collect())
 }
 
 async fn respond_interrogative_permission(
@@ -3749,18 +4014,13 @@ async fn respond_interrogative_permission(
     interrogative_id: &str,
     granted: bool,
 ) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", bearer_token))
-        .json(&serde_json::json!({"kind": "permission_answer", "granted": granted}))
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        warn!(status = %resp.status(), "Interrogative response failed");
-    }
-    Ok(())
+    crate::sync::respond(
+        base_url,
+        bearer_token,
+        interrogative_id,
+        serde_json::json!({"kind":"permission_answer","granted":granted}),
+    )
+    .await
 }
 
 /// POST a generic interrogative response to the daemon.
@@ -3782,9 +4042,6 @@ async fn respond_interrogative_generic(
     interrogative_type: &str,
     granted: bool,
 ) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
-
     let body = match interrogative_type {
         "confirmation" => serde_json::json!({"kind": "confirmation_answer", "confirmed": granted}),
         "capability" => serde_json::json!({"kind": "capability_answer", "granted": granted}),
@@ -3800,16 +4057,7 @@ async fn respond_interrogative_generic(
         }
     };
 
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", bearer_token))
-        .json(&body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        warn!(status = %resp.status(), "Generic interrogative response failed");
-    }
-    Ok(())
+    crate::sync::respond(base_url, bearer_token, interrogative_id, body).await
 }
 
 /// Render an `ask_user_question` payload as human-readable text so the user
@@ -3895,21 +4143,13 @@ async fn respond_ask_user_question(
     interrogative_id: &str,
     answers: &[serde_json::Value],
 ) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", bearer_token))
-        .json(&serde_json::json!({
-            "kind": "ask_user_question_answers",
-            "answers": answers
-        }))
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        warn!(status = %resp.status(), "ask_user_question response failed");
-    }
-    Ok(())
+    crate::sync::respond(
+        base_url,
+        bearer_token,
+        interrogative_id,
+        serde_json::json!({"kind":"ask_user_question_answers","answers":answers}),
+    )
+    .await
 }
 
 /// POST an arbitrary interrogative response body to `/interrogative/{id}/respond`.
@@ -3919,18 +4159,7 @@ async fn post_interrogative_response(
     interrogative_id: &str,
     body: &serde_json::Value,
 ) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", bearer_token))
-        .json(body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        warn!(status = %resp.status(), "Interrogative response failed");
-    }
-    Ok(())
+    crate::sync::respond(base_url, bearer_token, interrogative_id, body.clone()).await
 }
 
 /// POST `{"kind": "cancel"}` to the daemon to cancel a pending interrogative.
@@ -3939,18 +4168,13 @@ async fn cancel_interrogative(
     bearer_token: &str,
     interrogative_id: &str,
 ) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", bearer_token))
-        .json(&serde_json::json!({"kind": "cancel"}))
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        warn!(status = %resp.status(), "Interrogative cancel failed");
-    }
-    Ok(())
+    crate::sync::respond(
+        base_url,
+        bearer_token,
+        interrogative_id,
+        serde_json::json!({"kind":"cancel"}),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3959,22 +4183,33 @@ async fn cancel_interrogative(
 
 /// Simple SSE event parser: feeds bytes, yields complete `data:` payloads.
 struct SseParser {
-    buffer: String,
+    buffer: Vec<u8>,
 }
 
 impl SseParser {
     fn new() -> Self {
-        Self {
-            buffer: String::new(),
-        }
+        Self { buffer: Vec::new() }
     }
 
     fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
         let mut results = Vec::new();
-        self.buffer.push_str(&String::from_utf8_lossy(bytes));
-
-        while let Some(pos) = self.buffer.find("\n\n") {
-            let event_str: String = self.buffer.drain(..pos + 2).collect();
+        self.buffer.extend_from_slice(bytes);
+        loop {
+            let lf = self
+                .buffer
+                .windows(2)
+                .position(|w| w == b"\n\n")
+                .map(|p| (p, 2));
+            let crlf = self
+                .buffer
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|p| (p, 4));
+            let Some((pos, len)) = lf.into_iter().chain(crlf).min_by_key(|(p, _)| *p) else {
+                break;
+            };
+            let event_bytes: Vec<u8> = self.buffer.drain(..pos + len).collect();
+            let event_str = String::from_utf8_lossy(&event_bytes);
 
             // Extract data lines from the event
             let data: String = event_str
@@ -3998,6 +4233,16 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_parser_preserves_split_utf8_and_crlf_frames() {
+        let mut parser = SseParser::new();
+        let mut events = Vec::new();
+        for byte in "data: café 🦀\r\n\r\ndata: next\n\n".as_bytes() {
+            events.extend(parser.feed(&[*byte]));
+        }
+        assert_eq!(events, vec!["café 🦀", "next"]);
+    }
 
     #[test]
     fn reasoning_request_uses_explicit_effort_and_validates_capabilities() {

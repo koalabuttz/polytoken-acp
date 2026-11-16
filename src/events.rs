@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::v1::schema as acp;
 
 // ---------------------------------------------------------------------------
 // Daemon event types (from GET /events SSE stream)

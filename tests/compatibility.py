@@ -118,6 +118,8 @@ class Client:
         self.process = subprocess.Popen([shim], env=env, cwd=cwd, stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=log, text=True)
         self.messages = queue.Queue()
+        self.protocol = 1
+        self.elicitation = False
         self.counter = 0
         self.notifications = []
         threading.Thread(target=self.read, daemon=True).start()
@@ -128,18 +130,37 @@ class Client:
         self.messages.put(None)
 
     def request(self, method, params):
+        original_method = method
+        if self.protocol == 2:
+            if method == "initialize":
+                params = {"protocolVersion": 2, "info": {"name": "compat-test", "version": "1"}, "capabilities": {"elicitation":{"form":{}}} if self.elicitation else {}}
+            elif method == "session/load":
+                method = "session/resume"
+                params = {**params, "replayFrom": {"type": "start"}}
+            elif method == "session/set_mode":
+                method = "session/set_config_option"
+                params = {"sessionId": params["sessionId"], "configId": "permission_mode", "type":"select", "value": params["modeId"]}
+        if self.protocol == 2 and method == "session/set_config_option" and "type" not in params:
+            params = {**params,"type":"select"}
         self.counter += 1
         self.process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": self.counter,
                                             "method": method, "params": params}) + "\n")
         self.process.stdin.flush()
+        accepted = None
         while True:
             msg = self.messages.get(timeout=45)
             assert msg is not None, f"Shim exited during {method}"
             if "method" in msg:
                 self.notifications.append(msg)
+                update = msg.get("params", {}).get("update", {})
+                if self.protocol == 2 and original_method == "session/prompt" and update.get("sessionUpdate") == "state_update" and update.get("state") == "idle":
+                    assert accepted is not None, "v2 completion arrived before prompt insertion acknowledgement"
+                    return {"stopReason": update.get("stopReason"), "messageId": accepted["messageId"]}
                 if "id" in msg:
                     if msg["method"] == "session/request_permission":
                         result = {"outcome": {"outcome": "selected", "optionId": "allow_once"}}
+                    elif msg["method"] == "elicitation/create":
+                        result = {"action":"accept","content":{"q":"one"}}
                     else:
                         assert msg["method"] == "_polytoken/ask_user_question", msg
                         result = {"answers": [{"question_id": "q", "selected_option_ids": ["one"]}]}
@@ -148,7 +169,20 @@ class Client:
                     self.process.stdin.flush()
             elif msg.get("id") == self.counter:
                 assert "error" not in msg, (method, msg)
-                return msg["result"]
+                result = msg["result"]
+                if self.protocol == 2:
+                    if original_method == "session/prompt":
+                        assert "messageId" in result and "stopReason" not in result, result
+                        accepted = result
+                        continue
+                    def legacy_options(value):
+                        if isinstance(value, dict):
+                            if "configId" in value: value["id"] = value["configId"]
+                            for v in value.values(): legacy_options(v)
+                        elif isinstance(value, list):
+                            for v in value: legacy_options(v)
+                    legacy_options(result)
+                return result
 
     def close(self):
         self.process.stdin.close()
@@ -164,6 +198,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shim", required=True)
     parser.add_argument("--polytoken", required=True)
+    parser.add_argument("--protocol", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--elicitation", action="store_true")
     args = parser.parse_args()
     shim, polytoken = str(Path(args.shim).resolve()), str(Path(args.polytoken).resolve())
     print(subprocess.check_output([polytoken, "--version"], text=True).strip())
@@ -201,6 +237,8 @@ def main():
         with (root / "shim.log").open("w+") as log:
             try:
                 client = Client(shim, env, root, log)
+                client.protocol = args.protocol
+                client.elicitation = args.elicitation
                 client.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
                 mcp_servers = [{"type": "http", "name": "fixture_mcp", "url": f"http://127.0.0.1:{server.server_port}/mcp",
                                 "headers": [{"name": "Authorization", "value": "Bearer fixture-mcp-token"}]}]
@@ -228,7 +266,8 @@ def main():
                 print("PASS: reasoning effort, model switching, permission mode")
                 prompt = client.request("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "Reply compat-ok"}]})
                 assert prompt["stopReason"] == "end_turn", prompt
-                assert any(n.get("params", {}).get("update", {}).get("content", {}).get("text") == "compat-ok"
+                assert any(n.get("params", {}).get("update", {}).get("sessionUpdate") in ("agent_message_chunk", "agent_message")
+                           and "compat-ok" in json.dumps(n["params"]["update"]["content"])
                            for n in client.notifications), client.notifications
                 print("PASS: prompt submission and streamed response")
                 client.request("session/set_mode", {"sessionId": sid, "modeId": "standard"})
@@ -242,15 +281,24 @@ def main():
                 print("PASS: tool execution, permission round-trip, structured tool result")
                 before_question = len(client.notifications)
                 client.request("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "exercise-question"}]})
-                assert any(n.get("method") == "_polytoken/ask_user_question" for n in client.notifications[before_question:])
+                assert any(n.get("method") in ("_polytoken/ask_user_question","elicitation/create") for n in client.notifications[before_question:])
                 print("PASS: structured question extension and answer submission")
+                if args.protocol == 2:
+                    before_resync = len(client.notifications)
+                    resynced = client.request("session/resume", {"sessionId":sid,"cwd":str(root),"mcpServers":mcp_servers})
+                    assert resynced.get("availableCommands"), resynced
+                    assert not any(n.get("params",{}).get("update",{}).get("sessionUpdate") in ("agent_message", "agent_message_chunk") for n in client.notifications[before_resync:])
+                    replay = client.request("session/load", {"sessionId":sid,"cwd":str(root),"mcpServers":mcp_servers})
+                    assert replay.get("configOptions"), replay
+                    assert any(n.get("params",{}).get("update",{}).get("sessionUpdate") == "replay_complete" for n in client.notifications[before_resync:])
+                    print("PASS: active resume, optional replay and complete setup lists")
                 client.request("session/close", {"sessionId": sid})
                 before = len(client.notifications)
                 loaded = client.request("session/load", {"sessionId": sid, "cwd": str(root), "mcpServers": mcp_servers})
                 startup = json.loads(next(root.rglob("startup.json")).read_text())
                 base_url = f"http://127.0.0.1:{startup['port']}"
                 assert loaded.get("configOptions"), loaded
-                assert any(n.get("params", {}).get("update", {}).get("sessionUpdate") == "agent_message_chunk"
+                assert any(n.get("params", {}).get("update", {}).get("sessionUpdate") in ("agent_message_chunk", "agent_message")
                            for n in client.notifications[before:]), client.notifications[before:]
                 print("PASS: close, resume, saved transcript replay")
                 def cancel_when_started():

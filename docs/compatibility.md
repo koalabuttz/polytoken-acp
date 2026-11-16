@@ -12,7 +12,7 @@ Checked on 2026-11-16 against **Polytoken 0.9.8**, the stable release listed on 
 
 The downloaded archive's SHA-256 matched the [published Linux checksum](https://dl.polytoken.dev/0.9.8/SHA256SUMS.linux): `c45524a6f5c2ab782975366f486b559806303179beb43d94ff74a596848d151a`.
 
-## Fixes
+## Initial compatibility fixes
 
 - Pass the required `--harness-type acp` when launching a daemon.
 - Discover `startup.json` in the new `sessions-acp-v1/<id>/` tree, as well as the legacy `sessions-acp/<id>/` tree. Continue passing the legacy base to `--sessions-dir` so the daemon controls migration on resume. Remove stale startup files in both trees before launching, and detect early child exit without waiting for the full startup timeout.
@@ -26,6 +26,19 @@ The downloaded archive's SHA-256 matched the [published Linux checksum](https://
 - Remove the catch-all ACP dispatch handler, which intercepted successful client replies and replaced them with errors. This broke permission approvals and extension replies with the resolved ACP SDK. Let the SDK reject unknown requests and route responses normally.
 - Advertise HTTP MCP forwarding in the ACP capabilities.
 
+## Current protocol migration
+
+The shim now requires and implements the versioned client surface rather than relying on legacy event/history behavior:
+
+- Authenticated `/sync` checkpoints and matching `/daemon-state` catalogs.
+- Ordered replay from signed snapshot cursors, opaque revision deduplication, epoch checks, and explicit handling of reset/retention boundaries.
+- Correlated prompt, cancellation, and interrogative operations. Ambiguous retries keep the same operation ID, window, and request; cancellation stays bound to its accepted prompt.
+- Immutable checkpointed public-history pagination, capture-expiry restarts, and chunked text/JSON attachment retrieval.
+- Durable tool/result translation, job/subagent results, and terminal text reconciliation.
+- SDK 5.3.0 and negotiated ACP v2 draft support alongside v1. V2 implements insertion acknowledgements, stable message IDs, foreground lifecycle notifications, configuration modes, complete setup lists, optional history replay, and replay completion markers.
+
+See [protocol implementation](protocol.md) for recovery semantics, remaining restrictions, and the two narrow 0.9.8 `/state` fallbacks.
+
 ## Validation
 
 `cargo test --all-targets`, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` cover the Rust implementation. Regression cases include current event shapes, structured output, reasoning validation, opaque versus readable reasoning, and facet/mode separation.
@@ -37,11 +50,14 @@ The credential-free test [tests/compatibility.py](../tests/compatibility.py) lau
 - Explicit reasoning-effort and model changes, and permission-mode changes.
 - Prompt acceptance, streamed output, and normal turn completion.
 - A real `shell_exec` call (`printf compat-tool`), a forced permission approval through ACP, and the structured result.
-- An `ask_user_question` tool call and its extension request/answer round-trip.
+- An `ask_user_question` tool call through both the extension and native form elicitation request/answer paths.
 - Close followed by `session/load`, daemon resume, and saved transcript replay.
 - Cancellation while a provider request is in flight.
+- ACP v2 prompt insertion acknowledgements followed by terminal state, active-session resume with/without replay, complete setup lists, and replay completion boundaries.
 
-The final Windows run passed 149 unit tests and two non-ignored integration/smoke tests; eight existing account-dependent tests remain ignored. Formatting and strict Clippy checks passed. The isolated 0.9.8 test passed all the flows above, including rejecting unauthenticated HTTP access and checking that cancellation releases the daemon's turn.
+The Rust suite also covers a lost mutation response followed by an identical correlated retry, mismatched operation rejection, opaque revision deduplication, history capture expiry without page mixing, chunked UTF-8 attachment hydration, recovery suffix reconciliation, divergent history rejection, and stable v2 replay upserts. These controlled fault tests do not substitute for an end-to-end daemon restart/network outage test.
+
+The final Windows run passed **164 unit tests and two non-ignored integration/smoke tests**, plus formatting and strict Clippy checks. The isolated 0.9.8 test passed with ACP v1, ACP v2 with extension questions, and ACP v2 with native form elicitation, including rejection of unauthenticated HTTP access and confirmation that cancellation releases the daemon's turn. Eight existing account-dependent Rust tests remain ignored.
 
 Run on Linux or macOS, with Python 3 and built shim/daemon binaries:
 
@@ -49,16 +65,20 @@ Run on Linux or macOS, with Python 3 and built shim/daemon binaries:
 cargo build
 python3 tests/compatibility.py \
   --shim target/debug/polytoken-acp \
-  --polytoken /absolute/path/to/polytoken
+  --polytoken /absolute/path/to/polytoken --protocol 1
+python3 tests/compatibility.py \
+  --shim target/debug/polytoken-acp \
+  --polytoken /absolute/path/to/polytoken --protocol 2
+python3 tests/compatibility.py \
+  --shim target/debug/polytoken-acp \
+  --polytoken /absolute/path/to/polytoken --protocol 2 --elicitation
 ```
 
-The Rust suite was run on Windows; the real-daemon test was run in Ubuntu WSL with Polytoken 0.9.8. No hosted model/provider, real account OAuth, macOS runtime, old-session migration fixture, or Paseo UI was exercised. The local provider proves the shim/daemon path without making claims about every provider backend.
+The Rust suite was run on Windows; the real-daemon tests were run in Ubuntu WSL with Polytoken 0.9.8. T3 Code's local ACP v2 adapter tests were inspected for its initialization and insertion/state lifecycle expectations. No hosted model/provider, real account OAuth, macOS runtime, old-session migration fixture, Paseo UI, or T3 Code UI was exercised. The local provider proves the shim/daemon path without making claims about every provider backend. The installed daemon was not upgraded because repository scope excludes changes to it; all current-daemon testing used the isolated download.
 
 ## Compatibility boundary
 
-0.9.8 still exports the legacy `GET /state`, `GET /history`, and `GET /events` interfaces used by this shim. Requests without `operation_context` retain legacy behavior; empty-body turn cancellation is explicitly documented in `TurnCancelRequest`. Interrogative responses keep the flattened `{"kind": ...}` body. A wholesale protocol migration is not required for basic ACP operation.
-
-The shim does **not** implement `GET /sync`, `GET /events?after=...`, checkpointed public-history pagination, attachment retrieval, or operation-window retry correlation. It therefore has no cursor/epoch recovery or replay-safe mutation retry guarantees. A broken legacy stream can lose output or replay updates on reconnect; an explicit discontinuity or exhausted reconnect is reported as an error. New catalog events trigger refreshes through `/state`; the shim does not use `/daemon-state` as its authoritative metadata source.
+The initial compatibility commit retained legacy event/history behavior. The subsequent migration replaces that path with the current client protocol. Reconnects retain a signed snapshot cursor and deduplicate ordered revisions; a same-epoch reset can recover durable text when the original prompt is still active. Epoch changes, history rewrites, conflicting output, and an outcome lost beyond retention fail explicitly and require reload. See [the implementation report](protocol.md) for the precise guarantees and limits.
 
 ACP image/audio/file content still becomes text placeholders. Polytoken 0.9.8 itself accepts inline prompt images, but the shim does not advertise or forward native image input. Structured question/plan/goal presentation still depends on the ACP client's elicitation or Polytoken extension support. Native Polytoken subagents remain timeline tool calls; no Paseo-side track integration is introduced.
 

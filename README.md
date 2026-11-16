@@ -6,7 +6,7 @@ An [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) server shim f
 
 ## Current compatibility
 
-Audited against **Polytoken 0.9.8** on 2026-11-16, including exported schemas and a real-daemon test with a local mock provider. See the [compatibility audit](docs/compatibility.md) for fixes, validation, and protocol limits. Older versions are not guaranteed.
+Updated for **Polytoken 0.9.8's versioned client protocol** on 2026-11-16. Supports **ACP v2 (draft)** when requested by the client, including T3 Code's prompt/state lifecycle, and retains ACP v1. The Rust ACP SDK is pinned to 5.3.0 because v2 is still evolving. See the [protocol implementation](docs/protocol.md) and [compatibility audit](docs/compatibility.md) for validation and limits. Older daemon versions are not supported by this implementation.
 
 ## What It Does
 
@@ -16,10 +16,11 @@ Audited against **Polytoken 0.9.8** on 2026-11-16, including exported schemas an
 Paseo  ──stdio JSON-RPC──>  polytoken-acp (Rust binary, ACP Agent)
                                │
                                ├── spawns polytoken daemon (one per ACP session)
-                               ├── POST /prompt → 202 {prompt_id}
-                               ├── GET /events (SSE) → ACP session/update notifications
-                               ├── POST /interrogative/{id}/respond ← ACP session/request_permission
-                               └── POST /turn/cancel ← ACP session/cancel
+                               ├── GET /sync + /daemon-state → state and catalog
+                               ├── POST /prompt + operation_context → {prompt_id}
+                               ├── GET /events?after=<signed cursor> → ordered ACP updates
+                               ├── GET /history?checkpoint=... + /attachments/{id} → replay
+                               └── correlated question answers and targeted cancellation
 ```
 
 ## Building & Installing
@@ -64,9 +65,9 @@ Then launch Paseo, select "Polytoken" as the provider, and start a session.
 
 1. **Paseo spawns `polytoken-acp`** as a subprocess and communicates over stdio using JSON-RPC (ACP).
 2. **On `session/new`**, the shim spawns a `polytoken daemon` process for the session's working directory, using a random port and credential file. The daemon uses a dedicated sessions directory (`~/.local/share/polytoken/sessions-acp-v1/` in 0.9.8), separate from the default `sessions/` used by the polytoken TUI — see [Session Directory Isolation](#session-directory-isolation) below.
-3. **On `session/prompt`**, the shim forwards the prompt text to the daemon's `POST /prompt` endpoint, then connects to the daemon's SSE event stream (`GET /events`) and translates daemon events into ACP `session/update` notifications.
-4. **Permission requests** (interrogative events) are forwarded to the ACP client via `session/request_permission`, and responses are relayed back to the daemon via `POST /interrogative/{id}/respond`. **`ask_user_question` events** are forwarded via the `_polytoken/ask_user_question` extension method, and answers are relayed back.
-5. **On `session/cancel`**, the shim calls `POST /turn/cancel` on the daemon.
+3. **On `session/prompt`**, the shim takes an authenticated sync checkpoint, submits the text with a correlated operation ID, and consumes ordered records from that checkpoint. ACP v1 holds the prompt response until completion. ACP v2 returns the inserted user message's `messageId` immediately, then reports `running`, `requires_action`, and terminal `idle` states through notifications.
+4. **Permission requests** are forwarded through `session/request_permission`. Structured questions use native `elicitation/create` when the client advertises form support, otherwise `_polytoken/ask_user_question`. Answers carry daemon operation correlation.
+5. **On `session/cancel`**, the shim targets the accepted prompt's epoch, prompt ID, and observed generation, so a delayed cancellation cannot stop a later turn.
 6. **On disconnect** (stdin EOF), the shim terminates all daemon processes.
 
 ### Session Directory Isolation
@@ -82,34 +83,26 @@ ACP-managed daemon sessions are registered in a **separate** directory from the 
 
 By using a separate directory, ACP sessions are invisible to `polytoken sessions`, `polytoken attach <id>`, and `polytoken continue`. ACP resume (`session/load`) still works because the shim always passes `--sessions-dir sessions-acp` so `--resume` finds the saved history.
 
-The shim passes the legacy `sessions-acp` base to `--sessions-dir`; 0.9.8 derives the sibling `sessions-acp-v1` tree and controls migration on resume. Inspect current startup/state/history files under `sessions-acp-v1/<session_id>/`. The shim also checks the legacy startup path.
+The shim passes the legacy `sessions-acp` base to `--sessions-dir`; 0.9.8 derives the sibling `sessions-acp-v1` tree and controls migration on resume. Inspect current startup/state/history files under `sessions-acp-v1/<session_id>/`. The shim also checks the legacy startup path. ACP v1 resumes with `session/load` or `session/resume`; ACP v2 uses `session/resume`, with optional `replayFrom: {"type":"start"}`.
 
 ### Event Translation
 
-| Daemon SSE Event | ACP Action |
+The shim consumes the ordered sync stream, then adapts its public records to the negotiated ACP version:
+
+| Ordered daemon record | ACP action |
 |---|---|
-| `content_block_delta` (text) | `session/update` → `agent_message_chunk` |
-| `content_block_delta` (thinking) | `session/update` → `agent_thought_chunk` |
-| `content_block_delta` (redacted_thinking) | `session/update` → `agent_thought_chunk` (placeholder) |
-| `content_block_delta` (open_ai_reasoning_summary) | `session/update` → `agent_thought_chunk` |
-| `content_block_delta` (open_ai_reasoning_opaque) | Ignored (encrypted provider data) |
-| `content_block_delta` (signature_delta) | Ignored (no ACP equivalent) |
-| `message_start` | Ignored (no ACP equivalent needed) |
-| `tool_call` | `session/update` → `tool_call` (status: pending) |
-| `tool_result` | `session/update` → `tool_call_update` (status: completed/failed). Uses `content_full` when available, falls back to `content`. |
-| `interrogative` (permission) | `session/request_permission` → `POST /interrogative/{id}/respond` |
-| `interrogative` (confirmation, capability, goal_proposal) | `session/request_permission` → `POST /interrogative/{id}/respond` (mapped to appropriate response kind) |
-| `interrogative` (clarification, plan_handoff) | `session/request_permission` → `POST /interrogative/{id}/respond` (best-effort; cancelled if unsupported) |
-| `ask_user_question` | `ext_method` (`_polytoken/ask_user_question`) → `POST /interrogative/{id}/respond` |
-| `session_title_changed` | `session/update` → `session_info_update` (title) |
-| `facet_switch` (legacy: `facet_changed`) | Ignored (facets are slash commands, not ACP modes; mode maps to the permission monitor) |
-| `permission_monitor_switch` | `session/update` → `current_mode_update` |
-| `model_switch`, `model_options_changed`, `daemon_catalog_changed` | Refresh `config_option_update` from `/state` |
-| `message_complete` | `session/prompt` response with `stop_reason: end_turn` |
-| `turn_cancelled` | `session/prompt` response with `stop_reason: cancelled` |
-| `model_error` | `session/prompt` response with `stop_reason: end_turn` |
-| `harness_error`, `stream_discontinuity` | ACP prompt error |
-| heartbeat / unknown | Ignored |
+| `stream_block_started`, `stream_block_delta` | Text/thought chunks; v2 includes stable message IDs |
+| `history_appended` | Checkpointed public history supplies tool calls and structured results |
+| `interrogative_registered` | Permission, native elicitation, or Polytoken extension request |
+| `jobs_changed`, `subagent_changed` | Timeline tool updates and retained job results |
+| `title_changed` | `session_info_update` |
+| `model_changed`, `catalog_published`, `facet_changed` | Refresh configuration from matching sync/catalog snapshots |
+| `monitor_changed` | v1 mode update; v2 permission configuration update |
+| `todos_changed` | v1 plan; v2 plan upsert |
+| `turn_completed`, `turn_failed`, `slot_released` | Reconcile durable output, then completion or error |
+| Reset or expired cursor | Same-epoch resnapshot/reconciliation; ambiguous outcomes require reload |
+| `history_rewritten`, epoch change | Explicit reload-required error |
+| Unknown future record | Ignore without interpreting opaque revisions |
 
 ## Testing
 
@@ -205,10 +198,10 @@ Then fully quit and relaunch the ACP client (don't just open a new session tab) 
 
 The shim's own logging goes to stderr only. The daemon child process's stdout is piped and drained. If you see JSON-RPC errors, ensure nothing else writes to stdout.
 
-## Limitations (v1)
+## Limitations
 
 - **MCP server forwarding**: Paseo's `mcpServers` are forwarded to the polytoken daemon. When a client sends MCP servers in `session/new`, `session/resume`, or `session/load`, the shim converts them to polytoken's YAML config format and passes a temporary `--project-config-dir` to the daemon. The daemon merges this project-level config on top of the user's global config, so ACP-provided servers are available alongside any configured in `~/.config/polytoken/`. ACP `Stdio` servers map to polytoken's stdio transport; `Http` servers map to polytoken's streamable-HTTP transport. The `Sse` variant is **not supported** — polytoken has no SSE transport, so SSE servers are skipped with a warning. See [MCP Server Forwarding](docs/mcp-servers.md) for details.
-- **Image/file/audio prompts**: The shim forwards plain text to `POST /prompt`. The current daemon also accepts inline images, but native image forwarding is not implemented in this shim. ACP prompt content blocks of type `Image`, `ResourceLink`, `Resource`, and `Audio` are converted to descriptive text placeholders (e.g. `[image: image/png, 1234 bytes]`, `[resource: file:///src/main.rs]`) so the agent knows something was attached. A warning is logged each time a non-text block is converted.
+- **Image/file/audio prompts**: The shim forwards plain text to `POST /prompt`. Native image/audio forwarding is not implemented or advertised. ACP v2 rejects unadvertised media; v1 converts it to descriptive text placeholders. Resource links and embedded resources become descriptive text (e.g. `[resource: file:///src/main.rs]`). A warning is logged each time a non-text block is converted.
 - **`ask_user_question` via ext_method**: The daemon's `ask_user_question` events are forwarded to the ACP client via the `_polytoken/ask_user_question` extension method. The client must implement `ext_method` and return a JSON object with an `answers` array (each answer has `question_id`, `selected_option_ids`, and/or `free_text`). If the client does not support the extension or returns no answers, the interrogative is cancelled on the daemon so the agent can proceed.
 - **Non-permission interrogatives**: `confirmation`, `capability`, and `goal_proposal` interrogatives are mapped to ACP `session/request_permission` (allow/reject) and translated to the appropriate daemon response kind. `clarification` and `plan_handoff` types cannot be fully answered via ACP's permission mechanism (they need structured input) and are cancelled if rejected.
-- **Stream recovery**: The shim uses the supported legacy `/events` and `/history` routes, without the new synchronization cursors, epochs, checkpoints, or operation correlation. See the [compatibility boundary](docs/compatibility.md#compatibility-boundary).
+- **Recovery and ACP v2 boundaries**: Signed sync cursors, epoch checks, checkpointed history, attachment reads, and correlated retries are implemented. An epoch change, history rewrite, or terminal outcome lost beyond retention requires a session reload. ACP v2 currently supports replay from the start, one foreground prompt at a time, and active-session resynchronization with unchanged working directory/MCP settings. See [protocol details and limits](docs/protocol.md).

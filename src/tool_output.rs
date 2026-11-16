@@ -1,6 +1,6 @@
 //! Shared rendering for live `ToolLiveDisplayContent` and saved tool results.
 
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::v1::schema as acp;
 use serde_json::Value;
 
 /// Accept legacy strings as well as the current text, blocks, image and diff
