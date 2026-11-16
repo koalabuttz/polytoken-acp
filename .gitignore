@@ -4,3 +4,4 @@ Cargo.lock
 
 pr-body.md
 tmp/
+**/__pycache__/

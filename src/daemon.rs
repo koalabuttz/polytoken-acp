@@ -32,6 +32,7 @@ pub struct DaemonHandle {
     /// Temp directory containing MCP server config forwarded from the ACP
     /// client. Cleaned up on terminate.
     mcp_config_dir: Option<PathBuf>,
+    lease: Option<std::fs::File>,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +87,8 @@ impl DaemonHandle {
         let session_id = resume_session_id
             .map(|s| s.to_string())
             .unwrap_or_else(generate_session_id);
+        // Acquire ownership before touching startup.json or launching a child.
+        let lease = crate::store::lease(&session_id)?;
         // A fresh private directory also prevents a resumed session from
         // reusing a credential path or following an existing file symlink.
         let temp_dir = tempfile::Builder::new()
@@ -276,6 +279,7 @@ impl DaemonHandle {
             sessions_dir,
             temp_dir: Some(temp_dir),
             mcp_config_dir: None,
+            lease: Some(lease),
         };
 
         // Verify the daemon is responding
@@ -474,6 +478,7 @@ impl DaemonHandle {
         let _ = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.bearer_token))
+            .timeout(Duration::from_secs(2))
             .send()
             .await;
 
@@ -502,6 +507,7 @@ impl DaemonHandle {
         }
 
         info!(session_id = %self.session_id, "Daemon terminated");
+        self.lease.take();
     }
 }
 
@@ -576,7 +582,7 @@ fn startup_paths(sessions_dir: &Path, session_id: &str) -> Vec<PathBuf> {
 ///
 /// Session history still survives across polytoken-acp process restarts here
 /// so that `--resume` can find the saved `log.jsonl`.
-fn acp_sessions_dir() -> PathBuf {
+pub(crate) fn acp_sessions_dir() -> PathBuf {
     let data_dir = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {

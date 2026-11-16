@@ -1522,7 +1522,7 @@ pub fn resolve_permission_outcome(outcome: &acp::RequestPermissionOutcome) -> bo
 /// - `Text` blocks are joined directly.
 /// - `Image` blocks become `[image: <mime_type>, <size> bytes]`.
 /// - `ResourceLink` blocks become `[resource: <uri>]` (or `[resource: <name>] (<uri>)`).
-/// - `Resource` blocks become `[embedded resource: <mime_type>]`.
+/// - `Resource` blocks retain their text/blob contents with a media-type header.
 /// - `Audio` blocks become `[audio: <mime_type>, <size> bytes]`.
 pub fn extract_text(blocks: &[acp::ContentBlock]) -> String {
     use tracing::warn;
@@ -1551,20 +1551,20 @@ pub fn extract_text(blocks: &[acp::ContentBlock]) -> String {
                 }
             }
             acp::ContentBlock::Resource(resource) => {
-                let mime = match &resource.resource {
+                let (mime, content) = match &resource.resource {
                     acp::EmbeddedResourceResource::TextResourceContents(t) => {
-                        t.mime_type.as_deref().unwrap_or("text/plain")
+                        (t.mime_type.as_deref().unwrap_or("text/plain"), t.text.as_str())
                     }
                     acp::EmbeddedResourceResource::BlobResourceContents(b) => {
-                        b.mime_type.as_deref().unwrap_or("application/octet-stream")
+                        (b.mime_type.as_deref().unwrap_or("application/octet-stream"), b.blob.as_str())
                     }
-                    _ => "unknown",
+                    _ => ("unknown", ""),
                 };
                 warn!(
                     mime_type = mime,
-                    "Embedded resource in prompt — daemon only accepts text; converting to placeholder"
+                    "Embedding resource contents in the text prompt"
                 );
-                format!("[embedded resource: {}]", mime)
+                format!("[embedded resource: {}]\n{}", mime, content)
             }
             acp::ContentBlock::Audio(audio) => {
                 let size = audio.data.len();

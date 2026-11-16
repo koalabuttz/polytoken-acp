@@ -8,8 +8,11 @@ mod agent;
 mod daemon;
 mod events;
 mod history;
+mod prompt;
+mod store;
 mod sync;
 mod tool_output;
+mod v2;
 mod wire;
 
 use tracing::info;

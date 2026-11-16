@@ -56,7 +56,7 @@ struct AgentState {
 /// dropped by the ACP SDK if unhandled, and ext requests use error-catch
 /// fallbacks. Clients that want precise control advertise their support.
 #[derive(Clone, Debug)]
-struct ClientFeatureSupport {
+pub(crate) struct ClientFeatureSupport {
     /// Whether the client can render an `elicitation/create` form
     /// (single-select enum, multi-select, etc.).
     supports_elicitation: bool,
@@ -172,6 +172,7 @@ impl AgentState {
 /// Entry point: build the agent, wire up handlers, and run over stdio.
 pub async fn run(transport: impl agent_client_protocol::ConnectTo<Agent>) {
     let state = Arc::new(Mutex::new(AgentState::new()));
+    let v2 = Arc::new(crate::v2::Manager::default());
 
     let result = Agent
         .v1()
@@ -328,6 +329,85 @@ pub async fn run(transport: impl agent_client_protocol::ConnectTo<Agent>) {
             },
             on_receive_notification!(),
         )
+        .on_receive_request(
+            {
+                let manager = v2.clone();
+                let state = state.clone();
+                async move |req: acp::ClientRequest, responder, cx| {
+                    let acp::ClientRequest::ExtMethodRequest(ref extension) = req else {
+                        return Ok(agent_client_protocol::Handled::No {
+                            message: (req, responder),
+                            retry: false,
+                        });
+                    };
+                    if extension.method.as_ref() != "_polytoken/v2" {
+                        return Ok(agent_client_protocol::Handled::No {
+                            message: (req, responder),
+                            retry: false,
+                        });
+                    }
+                    let envelope: serde_json::Value = serde_json::from_str(extension.params.get())
+                        .map_err(|e| {
+                            agent_client_protocol::Error::invalid_params().data(e.to_string())
+                        })?;
+                    let features = state
+                        .lock()
+                        .unwrap()
+                        .client_features
+                        .clone()
+                        .unwrap_or_default();
+                    let manager = manager.clone();
+                    // Setup may await a safe workspace transition. Keep the
+                    // dispatcher free for permissions, cancellation and other
+                    // sessions while that request is pending.
+                    tokio::spawn(async move {
+                        let result = manager
+                            .request(
+                                envelope["method"].as_str().unwrap_or(""),
+                                envelope["params"].clone(),
+                                cx,
+                                features,
+                            )
+                            .await;
+                        let _ = match result {
+                            Ok(value) => responder.respond(value),
+                            Err(error) => responder.respond_with_error(error),
+                        };
+                    });
+                    Ok(agent_client_protocol::Handled::Yes)
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let manager = v2.clone();
+                let state = state.clone();
+                async move |req: acp::ClientNotification, cx| {
+                    if let acp::ClientNotification::ExtNotification(ref extension) = req
+                        && extension.method.as_ref() == "_polytoken/v2_cancel"
+                    {
+                        let params =
+                            serde_json::from_str(extension.params.get()).unwrap_or_default();
+                        let features = state
+                            .lock()
+                            .unwrap()
+                            .client_features
+                            .clone()
+                            .unwrap_or_default();
+                        let _ = manager
+                            .request("session/cancel", params, cx, features)
+                            .await;
+                        return Ok(agent_client_protocol::Handled::Yes);
+                    }
+                    Ok(agent_client_protocol::Handled::No {
+                        message: (req, cx),
+                        retry: false,
+                    })
+                }
+            },
+            on_receive_notification!(),
+        )
         // The SDK rejects unknown requests and routes client responses to their
         // awaiting handlers. A catch-all dispatch handler would also intercept
         // successful permission and extension responses and replace them with errors.
@@ -340,6 +420,7 @@ pub async fn run(transport: impl agent_client_protocol::ConnectTo<Agent>) {
     }
 
     // Clean up: terminate all daemon processes
+    v2.shutdown().await;
     let daemons: Vec<(String, DaemonHandle)> = state.lock().unwrap().sessions.drain().collect();
     for (_, mut daemon) in daemons {
         daemon.terminate().await;
@@ -411,6 +492,18 @@ async fn resync_active(
 // ---------------------------------------------------------------------------
 // Request handlers
 // ---------------------------------------------------------------------------
+
+fn validate_saved_session_id(id: &str) -> Result<(), agent_client_protocol::Error> {
+    if !crate::store::valid_id(id) {
+        return Err(agent_client_protocol::Error::invalid_params().data("Invalid session ID"));
+    }
+    let record = crate::store::read(id)
+        .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?;
+    if record.is_some_and(|v| v["deleted"] == true) {
+        return Err(agent_client_protocol::Error::new(-32002, "Unknown session"));
+    }
+    Ok(())
+}
 
 async fn handle_new_session(
     state: &Arc<Mutex<AgentState>>,
@@ -576,6 +669,9 @@ async fn handle_resume_session(
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
+    if let Err(error) = validate_saved_session_id(&session_id) {
+        return responder.respond_with_error(error);
+    }
     if req
         .meta
         .as_ref()
@@ -833,6 +929,9 @@ async fn handle_load_session(
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
+    if let Err(error) = validate_saved_session_id(&session_id) {
+        return responder.respond_with_error(error);
+    }
     if req
         .meta
         .as_ref()
@@ -1441,7 +1540,7 @@ fn permission_monitor_modes() -> Vec<acp::SessionMode> {
 /// `category: "model"` to populate their model picker. Each option value is
 /// the daemon model name (`AvailableModelEntry.name`), and the label is the
 /// display label (`AvailableModelEntry.label`).
-fn build_config_options(
+pub(crate) fn build_config_options(
     state: &Result<serde_json::Value, anyhow::Error>,
     _mode_state: &Option<acp::SessionModeState>,
     _permission_monitor: &Result<serde_json::Value, anyhow::Error>,
@@ -1541,7 +1640,9 @@ fn discover_facets(cwd: &std::path::Path) -> Vec<String> {
 /// For the `/facet` command, `_meta.polytoken.choices` is populated with the
 /// list of available facet names discovered from the filesystem, so ACP
 /// clients (e.g. Paseo) can render autocomplete suggestions.
-fn build_available_commands(cwd: &std::path::Path) -> Option<Vec<acp::AvailableCommand>> {
+pub(crate) fn build_available_commands(
+    cwd: &std::path::Path,
+) -> Option<Vec<acp::AvailableCommand>> {
     // Commands that make sense in an ACP context — the daemon can handle
     // these when they appear in a prompt. TUI-only commands are excluded.
     const ACP_SAFE_COMMANDS: &[&str] = &[
@@ -1625,7 +1726,7 @@ fn build_available_commands(cwd: &std::path::Path) -> Option<Vec<acp::AvailableC
 /// so clients can distinguish skills from regular slash commands. Skills are invoked
 /// via `@skill:<name>` in prompt text, but we advertise them with just the name so
 /// the shim can translate `/name` → `@skill:name` when forwarding the prompt.
-fn build_skill_commands(
+pub(crate) fn build_skill_commands(
     state: &Result<serde_json::Value, anyhow::Error>,
 ) -> Vec<acp::AvailableCommand> {
     let state = match state {
@@ -1845,7 +1946,10 @@ fn build_thought_level_config_option(
 }
 
 /// Use the explicit reasoning field; model selector suffixes are unnecessary.
-fn build_reasoning_request(state: &serde_json::Value, value: &str) -> Option<serde_json::Value> {
+pub(crate) fn build_reasoning_request(
+    state: &serde_json::Value,
+    value: &str,
+) -> Option<serde_json::Value> {
     let option = build_thought_level_config_option(&Ok(state.clone()))?;
     let option_json = serde_json::to_value(option).ok()?;
     if !option_json
@@ -1921,7 +2025,10 @@ fn build_mcp_config_options(
 /// `Stdio` maps directly; `Http` maps to polytoken's `http` transport. The
 /// `Sse` variant is **skipped** because SSE and streamable-HTTP are
 /// different MCP protocols — polytoken has no SSE transport.
-fn write_mcp_servers_config(mcp_servers: &[acp::McpServer], temp_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn write_mcp_servers_config(
+    mcp_servers: &[acp::McpServer],
+    temp_dir: &Path,
+) -> Option<PathBuf> {
     if mcp_servers.is_empty() {
         return None;
     }
@@ -2659,6 +2766,30 @@ async fn reset_projection(
 }
 
 /// Process a single SSE event and translate it into ACP actions.
+pub(crate) async fn forward_v2_interrogative(
+    conn: &ConnectionTo<Client>,
+    event: &serde_json::Value,
+    session_id: &str,
+    base: &str,
+    token: &str,
+    cwd: &Path,
+    features: &ClientFeatureSupport,
+) {
+    let prompt = event["prompt_id"].as_str().unwrap_or("");
+    let _ = process_sse_event(
+        &event.to_string(),
+        prompt,
+        session_id,
+        base,
+        token,
+        cwd,
+        &mut None,
+        conn,
+        features,
+    )
+    .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_sse_event(
     data: &str,
@@ -3186,7 +3317,11 @@ async fn handle_interrogative(
 ///
 /// Extension notifications are best-effort: if the client doesn't recognize
 /// the method, it silently ignores it (per the ACP extensibility spec).
-fn send_ext_notification(conn: &ConnectionTo<Client>, method: &str, params: &serde_json::Value) {
+pub(crate) fn send_ext_notification(
+    conn: &ConnectionTo<Client>,
+    method: &str,
+    params: &serde_json::Value,
+) {
     let raw = match serde_json::value::RawValue::from_string(params.to_string()) {
         Ok(raw) => std::sync::Arc::from(raw),
         Err(e) => {
@@ -4182,16 +4317,16 @@ async fn cancel_interrogative(
 // ---------------------------------------------------------------------------
 
 /// Simple SSE event parser: feeds bytes, yields complete `data:` payloads.
-struct SseParser {
+pub(crate) struct SseParser {
     buffer: Vec<u8>,
 }
 
 impl SseParser {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { buffer: Vec::new() }
     }
 
-    fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
         let mut results = Vec::new();
         self.buffer.extend_from_slice(bytes);
         loop {

@@ -83,6 +83,20 @@ class Provider(BaseHTTPRequestHandler):
                        "arguments": json.dumps({"questions": [{"id": "q", "question": "Pick one", "mode": "single_select",
                            "allow_free_text": True, "options": [{"id": "one", "label": "One", "description": "First option"}]}]})}
             response["output"] = [message]
+        background_cancel = (body.get("stream") and "exercise-background-cancel" in json.dumps(body.get("input"))
+                             and not getattr(self.server, "background_cancel_fired", False))
+        background_turn = (body.get("stream") and "exercise-background" in json.dumps(body.get("input"))
+                           and not getattr(self.server, "background_fired", False))
+        if background_cancel or background_turn:
+            if background_cancel:
+                self.server.background_cancel_fired = True
+            else:
+                self.server.background_fired = True
+            call = "fc-background-cancel" if background_cancel else "fc-background"
+            command = "sleep 30; printf cancelled-too-late" if background_cancel else "sleep 2; printf background-done"
+            message = {"id":call,"type":"function_call","status":"completed","call_id":call,
+                       "name":"shell_exec","arguments":json.dumps({"command":command,"background":True})}
+            response["output"] = [message]
         if body.get("stream"):
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()

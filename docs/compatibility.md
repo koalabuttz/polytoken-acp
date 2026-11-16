@@ -55,9 +55,22 @@ The credential-free test [tests/compatibility.py](../tests/compatibility.py) lau
 - Cancellation while a provider request is in flight.
 - ACP v2 prompt insertion acknowledgements followed by terminal state, active-session resume with/without replay, complete setup lists, and replay completion boundaries.
 
-The Rust suite also covers a lost mutation response followed by an identical correlated retry, mismatched operation rejection, opaque revision deduplication, history capture expiry without page mixing, chunked UTF-8 attachment hydration, recovery suffix reconciliation, divergent history rejection, and stable v2 replay upserts. These controlled fault tests do not substitute for an end-to-end daemon restart/network outage test.
+The Rust suite also covers a lost mutation response followed by an identical correlated retry, mismatched operation rejection, opaque revision deduplication, history capture expiry without page mixing, chunked UTF-8 attachment hydration, recovery suffix reconciliation, divergent v1 history rejection, canonical queued-message IDs, retained pre-compaction history, safe session IDs, and exclusive session leases.
 
-The final Windows run passed **164 unit tests and two non-ignored integration/smoke tests**, plus formatting and strict Clippy checks. The isolated 0.9.8 test passed with ACP v1, ACP v2 with extension questions, and ACP v2 with native form elicitation, including rejection of unauthenticated HTTP access and confirmation that cancellation releases the daemon's turn. Eight existing account-dependent Rust tests remain ignored.
+The final Windows run passed **170 unit tests and two non-ignored integration/smoke tests**, plus formatting and strict Clippy checks. The isolated 0.9.8 test passed with ACP v1, ACP v2 with extension questions, and ACP v2 with native form elicitation, including rejection of unauthenticated HTTP access and confirmation that cancellation releases the daemon's turn. Eight existing account-dependent Rust tests remain ignored.
+
+The additional real-daemon [v2 protocol suite](../tests/v2_protocol.py) verifies:
+
+- Discovery of daemon sessions without a preexisting shim index.
+- Embedded resource contents and native image bytes reaching the mock provider.
+- Overlapping prompt admission, replay during foreground work, and stable user IDs after queue drain.
+- Locally handled slash commands finish after insertion without waiting for a nonexistent model turn.
+- Background terminal declarations, output/completion after foreground idle, and targeted client cancellation.
+- MCP/workspace replacement while a turn runs: work continues, setup waits, and the new daemon actually runs in the requested directory.
+- Saved discovery and replay after a shim process restart.
+- Terminating the isolated daemon, automatic recovery, and no resubmitted provider request.
+- Immutable 100-entry list pages, repeatable opaque cursors, filtering, and invalid/unknown-session errors.
+- Deleting an active session while the provider is blocked, repeatable deletion, and subsequent resume/prompt rejection.
 
 Run on Linux or macOS, with Python 3 and built shim/daemon binaries:
 
@@ -72,14 +85,17 @@ python3 tests/compatibility.py \
 python3 tests/compatibility.py \
   --shim target/debug/polytoken-acp \
   --polytoken /absolute/path/to/polytoken --protocol 2 --elicitation
+python3 tests/v2_protocol.py \
+  --shim target/debug/polytoken-acp \
+  --polytoken /absolute/path/to/polytoken
 ```
 
 The Rust suite was run on Windows; the real-daemon tests were run in Ubuntu WSL with Polytoken 0.9.8. T3 Code's local ACP v2 adapter tests were inspected for its initialization and insertion/state lifecycle expectations. No hosted model/provider, real account OAuth, macOS runtime, old-session migration fixture, Paseo UI, or T3 Code UI was exercised. The local provider proves the shim/daemon path without making claims about every provider backend. The installed daemon was not upgraded because repository scope excludes changes to it; all current-daemon testing used the isolated download.
 
 ## Compatibility boundary
 
-The initial compatibility commit retained legacy event/history behavior. The subsequent migration replaces that path with the current client protocol. Reconnects retain a signed snapshot cursor and deduplicate ordered revisions; a same-epoch reset can recover durable text when the original prompt is still active. Epoch changes, history rewrites, conflicting output, and an outcome lost beyond retention fail explicitly and require reload. See [the implementation report](protocol.md) for the precise guarantees and limits.
+The initial compatibility commit retained legacy event/history behavior. The subsequent migration uses the versioned client protocol. ACP v2 now observes sessions persistently, resynchronizes entity upserts after gaps/rewrites, and recovers an unavailable owned daemon without resubmitting work. A healthy daemon is not killed because a projection failed. Unknown terminal outcomes remain explicit errors. V1 retains conservative reload-required handling. See [the implementation report](protocol.md) for precise guarantees and limits.
 
-ACP image/audio/file content still becomes text placeholders. Polytoken 0.9.8 itself accepts inline prompt images, but the shim does not advertise or forward native image input. Structured question/plan/goal presentation still depends on the ACP client's elicitation or Polytoken extension support. Native Polytoken subagents remain timeline tool calls; no Paseo-side track integration is introduced.
+V2 supports native images and preserves embedded resources. Audio remains unsupported; V1 retains image/audio placeholders. Structured question/plan/goal presentation still depends on client elicitation or extension support. Native subagents remain timeline tools; ACP child-session ownership, Outpost fleets, and plugin surfaces are not advertised. No Paseo, T3 Code, or daemon binary was modified.
 
 Older daemon versions and future releases are not guaranteed. Re-run the contract exports and the real-daemon test after an upgrade. The daemon's reported OpenAPI `info.version` is `0.1.0` even in release 0.9.8; use `polytoken --version` to identify the tested release.
