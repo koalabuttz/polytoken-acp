@@ -8,6 +8,8 @@ An [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) server shim f
 
 Updated for **Polytoken 0.9.8's versioned client protocol** on 2026-11-16. Supports **ACP v2 (draft)** when requested by the client, including T3 Code's prompt/state lifecycle, and retains ACP v1. The Rust ACP SDK is pinned to 5.3.0 because v2 is still evolving. See the [protocol implementation](docs/protocol.md) and [compatibility audit](docs/compatibility.md) for validation and limits. Older daemon versions are not supported by this implementation.
 
+Clients can opt into the [plugin-surface extension](docs/surfaces.md) for session-bound discovery, HTML retrieval, and cancellable HTTP/SSE streaming. Its [JSON Schema](docs/surfaces.schema.json) and [example exchanges](docs/surfaces.examples.json) define the client contract. Rendering, sandboxing, and Datastar injection belong to the client; actual T3 rendering and HTTP callbacks against a loaded plugin remain unverified.
+
 ## What It Does
 
 `polytoken-acp` bridges ACP (JSON-RPC over stdio) to the Polytoken daemon's HTTP/SSE API. This allows Paseo — or any ACP-compatible editor — to drive Polytoken as an agent without the TUI.
@@ -134,6 +136,8 @@ cargo test -- --ignored
 
 For a reproducible real-daemon test without API credentials, run [tests/compatibility.py](tests/compatibility.py) as described in the [audit](docs/compatibility.md#validation).
 
+[tests/surfaces.py](tests/surfaces.py) validates the optional surface extension against its published JSON Schema using a mock daemon, including HTTP bytes, flow control, cancellation, and reconnect. It also supports real-daemon empty-catalog discovery. See the [surface contract](docs/surfaces.md#errors-and-verification) for commands and verification limits.
+
 ## Troubleshooting
 
 ### Debug logging
@@ -205,4 +209,5 @@ The shim's own logging goes to stderr only. The daemon child process's stdout is
 - **`ask_user_question` via ext_method**: The daemon's `ask_user_question` events are forwarded to the ACP client via the `_polytoken/ask_user_question` extension method. The client must implement `ext_method` and return a JSON object with an `answers` array (each answer has `question_id`, `selected_option_ids`, and/or `free_text`). If the client does not support the extension or returns no answers, the interrogative is cancelled on the daemon so the agent can proceed.
 - **Non-permission interrogatives**: `confirmation`, `capability`, and `goal_proposal` interrogatives are mapped to ACP `session/request_permission` (allow/reject) and translated to the appropriate daemon response kind. `clarification` and `plan_handoff` types cannot be fully answered via ACP's permission mechanism (they need structured input) and are cancelled if rejected.
 - **ACP v2 sessions**: Supports queued prompt admission, replay during work, saved-session discovery/pagination, soft deletion, settings replacement, and persistent background updates. Changing the working directory waits for existing work to finish before resume succeeds. Background shell/service jobs expose output and cancellation through ACP terminals. Native subagents use the standard child-session draft when supported; see [worker-session support and limitations](docs/subagent-sessions.md).
+- **Plugin surfaces**: Optional capability negotiation enables discovery and plugin-local HTTP/SSE transport on owning sessions in v1 and v2. Streams are not replayable, and observed surface metadata cannot guarantee atomic generation-bound HTTP execution. See the [contract and client checklist](docs/surfaces.md).
 - **Recovery**: Signed cursors, epoch checks, checkpointed history, attachment reads, and correlated retries are implemented. V2 resynchronizes retained history after gaps/rewrites and relaunches an unavailable owned daemon without resubmitting prompts. An unobservable terminal outcome is reported as an error. V1 retains conservative reload-required handling. See [protocol details and remaining optional capabilities](docs/protocol.md).

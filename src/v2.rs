@@ -73,6 +73,16 @@ struct Inner {
 }
 
 impl Manager {
+    pub fn owns(&self, id: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(id)
+    }
+    pub async fn endpoint(&self, id: &str) -> Option<crate::surfaces::Endpoint> {
+        let session = self.sessions.lock().unwrap().get(id).cloned()?;
+        let inner = session.inner.lock().await;
+        (!inner.closed).then(|| {
+            crate::surfaces::Endpoint::new(inner.daemon.base_url(), inner.daemon.bearer_token())
+        })
+    }
     pub async fn request(
         self: &Arc<Self>,
         method: &str,
@@ -383,6 +393,9 @@ impl Manager {
             session
         };
         let mut inner = session.inner.lock().await;
+        if session.features.supports_surfaces {
+            session.features.surfaces.reopen(&session.id);
+        }
         session
             .restart_if_idle(&mut inner)
             .await
@@ -523,6 +536,7 @@ impl Manager {
         if let Some(session) = session {
             session.stop.cancel();
             session.features.children.close(id);
+            session.features.surfaces.close(id);
             let mut inner = session.inner.lock().await;
             inner.closed = true;
             inner.daemon.terminate().await;
@@ -929,6 +943,19 @@ impl Session {
     }
 
     async fn current(&self, inner: &mut Inner, force: bool) -> Result<()> {
+        if self.features.supports_surfaces {
+            self.features
+                .surfaces
+                .bind(
+                    &self.id,
+                    crate::surfaces::Endpoint::new(
+                        inner.daemon.base_url(),
+                        inner.daemon.bearer_token(),
+                    ),
+                    &self.conn,
+                )
+                .await;
+        }
         if !inner.children_paused {
             self.children(inner, false, true).await;
         }

@@ -1,0 +1,311 @@
+{
+  "capabilityKey": "io.github.koalabuttz/polytoken-surfaces",
+  "initialization": [
+    {
+      "client": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": 1,
+          "clientInfo": {
+            "name": "t3",
+            "version": "example"
+          },
+          "clientCapabilities": {
+            "_meta": {
+              "io.github.koalabuttz/polytoken-surfaces": {
+                "versions": [
+                  1
+                ]
+              }
+            }
+          }
+        }
+      },
+      "agentCapabilityFragment": {
+        "agentCapabilities": {
+          "_meta": {
+            "io.github.koalabuttz/polytoken-surfaces": {
+              "version": 1,
+              "limits": {
+                "requestBytes": 1048576,
+                "htmlBytes": 262144,
+                "chunkBytes": 16384,
+                "initialCredits": 4,
+                "activePerSession": 8,
+                "activePerConnection": 32,
+                "requestIdsPerSubscription": 4096,
+                "ackTimeoutMs": 30000
+              },
+              "generationAtomicDispatch": false,
+              "bodyRevisionVerified": false,
+              "httpStreamReplay": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "client": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": 2,
+          "info": {
+            "name": "t3",
+            "version": "example"
+          },
+          "capabilities": {
+            "_meta": {
+              "io.github.koalabuttz/polytoken-surfaces": {
+                "versions": [
+                  1
+                ]
+              }
+            }
+          }
+        }
+      },
+      "agentCapabilityFragment": {
+        "capabilities": {
+          "_meta": {
+            "io.github.koalabuttz/polytoken-surfaces": {
+              "version": 1,
+              "limits": {
+                "requestBytes": 1048576,
+                "htmlBytes": 262144,
+                "chunkBytes": 16384,
+                "initialCredits": 4,
+                "activePerSession": 8,
+                "activePerConnection": 32,
+                "requestIdsPerSubscription": 4096,
+                "ackTimeoutMs": 30000
+              },
+              "generationAtomicDispatch": false,
+              "bodyRevisionVerified": false,
+              "httpStreamReplay": false
+            }
+          }
+        }
+      }
+    }
+  ],
+  "htmlExchange": [
+    {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "method": "_io.github.koalabuttz/polytoken-surfaces/subscribe",
+      "params": {
+        "sessionId": "session-root"
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "result": {
+        "subscriptionId": "subscription-1",
+        "daemonEpoch": "epoch-1",
+        "sequence": "0",
+        "surfaces": [
+          {
+            "pluginName": "demo",
+            "surfaceId": "page",
+            "generation": "00000000-0000-7000-8000-000000000001",
+            "revision": "1",
+            "source": {
+              "type": "plugin_http",
+              "path": "/surface"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 3,
+      "method": "_io.github.koalabuttz/polytoken-surfaces/getHtml",
+      "params": {
+        "sessionId": "session-root",
+        "subscriptionId": "subscription-1",
+        "daemonEpoch": "epoch-1",
+        "surface": {
+          "pluginName": "demo",
+          "surfaceId": "page",
+          "generation": "00000000-0000-7000-8000-000000000001",
+          "revision": "1"
+        },
+        "requestId": "html-1"
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 3,
+      "result": {
+        "requestId": "html-1",
+        "observedSurface": {
+          "pluginName": "demo",
+          "surfaceId": "page",
+          "generation": "00000000-0000-7000-8000-000000000001",
+          "revision": "1",
+          "source": {
+            "type": "plugin_http",
+            "path": "/surface"
+          }
+        },
+        "generationAtomicDispatch": false,
+        "bodyRevisionVerified": false
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "_io.github.koalabuttz/polytoken-surfaces/httpEvent",
+      "params": {
+        "sessionId": "session-root",
+        "subscriptionId": "subscription-1",
+        "daemonEpoch": "epoch-1",
+        "surface": {
+          "pluginName": "demo",
+          "surfaceId": "page",
+          "generation": "00000000-0000-7000-8000-000000000001",
+          "revision": "1"
+        },
+        "requestId": "html-1",
+        "sequence": "0",
+        "event": {
+          "kind": "headers",
+          "status": 200,
+          "headers": [
+            [
+              "content-type",
+              "dGV4dC9odG1s"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "_io.github.koalabuttz/polytoken-surfaces/httpEvent",
+      "params": {
+        "sessionId": "session-root",
+        "subscriptionId": "subscription-1",
+        "daemonEpoch": "epoch-1",
+        "surface": {
+          "pluginName": "demo",
+          "surfaceId": "page",
+          "generation": "00000000-0000-7000-8000-000000000001",
+          "revision": "1"
+        },
+        "requestId": "html-1",
+        "sequence": "1",
+        "event": {
+          "kind": "body",
+          "bodyBase64": "PGgxPkhlbGxvPC9oMT4="
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 4,
+      "method": "_io.github.koalabuttz/polytoken-surfaces/ack",
+      "params": {
+        "sessionId": "session-root",
+        "subscriptionId": "subscription-1",
+        "requestId": "html-1",
+        "throughSequence": "1"
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 4,
+      "result": {}
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "_io.github.koalabuttz/polytoken-surfaces/httpEvent",
+      "params": {
+        "sessionId": "session-root",
+        "subscriptionId": "subscription-1",
+        "daemonEpoch": "epoch-1",
+        "surface": {
+          "pluginName": "demo",
+          "surfaceId": "page",
+          "generation": "00000000-0000-7000-8000-000000000001",
+          "revision": "1"
+        },
+        "requestId": "html-1",
+        "sequence": "2",
+        "event": {
+          "kind": "end",
+          "result": {
+            "outcome": "complete"
+          }
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "_io.github.koalabuttz/polytoken-surfaces/surfaceEvent",
+      "params": {
+        "sessionId": "session-root",
+        "subscriptionId": "subscription-1",
+        "daemonEpoch": "epoch-1",
+        "sequence": "1",
+        "event": {
+          "kind": "reset",
+          "reason": "sync_unavailable",
+          "surfaces": null
+        }
+      }
+    }
+  ],
+  "sseRequest": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "method": "_io.github.koalabuttz/polytoken-surfaces/request",
+    "params": {
+      "sessionId": "session-root",
+      "subscriptionId": "subscription-1",
+      "daemonEpoch": "epoch-1",
+      "surface": {
+        "pluginName": "demo",
+        "surfaceId": "page",
+        "generation": "00000000-0000-7000-8000-000000000001",
+        "revision": "1"
+      },
+      "requestId": "updates-1",
+      "method": "GET",
+      "path": "/updates",
+      "headers": [
+        [
+          "accept",
+          "text/event-stream"
+        ],
+        [
+          "datastar-request",
+          "true"
+        ]
+      ]
+    }
+  },
+  "cancel": {
+    "jsonrpc": "2.0",
+    "id": 6,
+    "method": "_io.github.koalabuttz/polytoken-surfaces/cancel",
+    "params": {
+      "sessionId": "session-root",
+      "subscriptionId": "subscription-1",
+      "requestId": "updates-1"
+    }
+  },
+  "error": {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "error": {
+      "code": -32071,
+      "message": "Stale surface generation or revision"
+    }
+  }
+}

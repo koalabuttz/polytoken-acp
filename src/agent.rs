@@ -59,6 +59,8 @@ struct AgentState {
 pub(crate) struct ClientFeatureSupport {
     pub(crate) supports_child_sessions: bool,
     pub(crate) children: Arc<crate::children::Hub>,
+    pub(crate) supports_surfaces: bool,
+    pub(crate) surfaces: Arc<crate::surfaces::Hub>,
     /// Whether the client can render an `elicitation/create` form
     /// (single-select enum, multi-select, etc.).
     supports_elicitation: bool,
@@ -82,6 +84,8 @@ impl Default for ClientFeatureSupport {
         Self {
             supports_child_sessions: false,
             children: Arc::new(crate::children::Hub::default()),
+            supports_surfaces: false,
+            surfaces: Arc::new(crate::surfaces::Hub::default()),
             supports_elicitation: false,
             supports_subagent_events: true,
             supports_system_reminder: true,
@@ -94,6 +98,8 @@ impl Default for ClientFeatureSupport {
 impl ClientFeatureSupport {
     /// Build from the client's `initialize` request.
     fn from_initialize(caps: &acp::ClientCapabilities, meta: &Option<acp::Meta>) -> Self {
+        let supports_surfaces =
+            crate::surfaces::offered(Some(&serde_json::to_value(&caps.meta).unwrap_or_default()));
         let supports_elicitation = caps
             .elicitation
             .as_ref()
@@ -116,6 +122,8 @@ impl ClientFeatureSupport {
                 Self {
                     supports_child_sessions: caps.subagents.is_some(),
                     children: Arc::new(crate::children::Hub::default()),
+                    supports_surfaces,
+                    surfaces: Arc::new(crate::surfaces::Hub::default()),
                     supports_elicitation,
                     supports_subagent_events: has("subagent_started") || has("subagent_completed"),
                     supports_system_reminder: has("system_reminder"),
@@ -128,6 +136,7 @@ impl ClientFeatureSupport {
                 }
             }
             None => Self {
+                supports_surfaces,
                 supports_child_sessions: caps.subagents.is_some(),
                 supports_elicitation,
                 ..Default::default()
@@ -202,6 +211,10 @@ pub async fn run(transport: impl agent_client_protocol::ConnectTo<Agent>) {
                     }
 
                     let mut ext_meta = serde_json::Map::new();
+                    ext_meta.insert(
+                        crate::surfaces::CAPABILITY.into(),
+                        crate::surfaces::capability(),
+                    );
                     ext_meta.insert(
                         "polytoken".to_string(),
                         serde_json::json!({
@@ -347,6 +360,88 @@ pub async fn run(transport: impl agent_client_protocol::ConnectTo<Agent>) {
                             retry: false,
                         });
                     };
+                    if extension.method.starts_with(crate::surfaces::PREFIX) {
+                        let features = state
+                            .lock()
+                            .unwrap()
+                            .client_features
+                            .clone()
+                            .unwrap_or_default();
+                        if !features.supports_surfaces {
+                            return responder
+                                    .respond_with_error(
+                                        agent_client_protocol::Error::method_not_found(),
+                                    )
+                                    .map(|_| agent_client_protocol::Handled::Yes);
+                        }
+                        let method = extension.method.to_string();
+                        let params: serde_json::Value =
+                            serde_json::from_str(extension.params.get()).map_err(|e| {
+                                agent_client_protocol::Error::invalid_params().data(e.to_string())
+                            })?;
+                        let Some(id) = params["sessionId"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string)
+                        else {
+                            return responder
+                                .respond_with_error(
+                                    agent_client_protocol::Error::invalid_params()
+                                        .data("Missing sessionId"),
+                                )
+                                .map(|_| agent_client_protocol::Handled::Yes);
+                        };
+                        let endpoint = state.lock().unwrap().sessions.get(&id).map(|d| {
+                            crate::surfaces::Endpoint::new(d.base_url(), d.bearer_token())
+                        });
+                        if endpoint.is_none() && !manager.owns(&id) {
+                            return responder
+                                .respond_with_error(agent_client_protocol::Error::new(
+                                    -32002,
+                                    "Unknown active owning session",
+                                ))
+                                .map(|_| agent_client_protocol::Handled::Yes);
+                        }
+                        let hub = features.surfaces.clone();
+                        let manager = manager.clone();
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            let endpoint = if endpoint.is_some() {
+                                endpoint
+                            } else if !hub.bound(&id) {
+                                manager.endpoint(&id).await
+                            } else {
+                                None
+                            };
+                            if let Some(endpoint) = endpoint {
+                                hub.bind(&id, endpoint, &cx).await;
+                            }
+                            if !manager.owns(&id)
+                                && !state.lock().unwrap().sessions.contains_key(&id)
+                            {
+                                let _ = responder.respond_with_error(
+                                    agent_client_protocol::Error::new(
+                                        -32002,
+                                        "Owning session closed",
+                                    ),
+                                );
+                                return;
+                            }
+                            match hub.request(&method, params).await {
+                                Ok(reply) => {
+                                    if responder.respond(reply.result).is_ok()
+                                        && let Some(after) = reply.after
+                                    {
+                                        after();
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = responder.respond_with_error(error);
+                                }
+                            }
+                        });
+                        return Ok(agent_client_protocol::Handled::Yes);
+                    }
                     if extension.method.as_ref() != "_polytoken/v2" {
                         return Ok(agent_client_protocol::Handled::No {
                             message: (req, responder),
@@ -428,6 +523,9 @@ pub async fn run(transport: impl agent_client_protocol::ConnectTo<Agent>) {
 
     // Clean up: terminate all daemon processes
     v2.shutdown().await;
+    if let Some(features) = &state.lock().unwrap().client_features {
+        features.surfaces.shutdown();
+    }
     let daemons: Vec<(String, DaemonHandle)> = state.lock().unwrap().sessions.drain().collect();
     for (_, mut daemon) in daemons {
         daemon.terminate().await;
@@ -560,6 +658,18 @@ async fn prepare_children(
 fn observe_children(state: &Arc<Mutex<AgentState>>, sid: &str, conn: &ConnectionTo<Client>) {
     let s = state.lock().unwrap();
     let features = s.client_features.clone().unwrap_or_default();
+    if features.supports_surfaces
+        && let Some(d) = s.sessions.get(sid)
+    {
+        features.surfaces.reopen(sid);
+        let hub = features.surfaces.clone();
+        let endpoint = crate::surfaces::Endpoint::new(d.base_url(), d.bearer_token());
+        let id = sid.to_string();
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            hub.bind(&id, endpoint, &conn).await;
+        });
+    }
     if features.supports_child_sessions
         && let Some(d) = s.sessions.get(sid)
     {
@@ -1227,6 +1337,9 @@ async fn handle_close_session(
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
     info!(session_id = %session_id, "ACP session/close");
+    if let Some(features) = &state.lock().unwrap().client_features {
+        features.surfaces.close(&session_id);
+    }
     if crate::children::Hub::child_id(&session_id) {
         return responder.respond_with_error(
             agent_client_protocol::Error::invalid_params()

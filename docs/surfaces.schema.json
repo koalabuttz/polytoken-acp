@@ -1,0 +1,1118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Polytoken ACP surfaces extension version 1",
+  "description": "Operational bounds, byte/header semantics, and event ordering are additionally normative in surfaces.md. Result schemas are selected using the originating RPC method.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/subscribeRequest"
+    },
+    {
+      "$ref": "#/$defs/unsubscribeRequest"
+    },
+    {
+      "$ref": "#/$defs/getHtmlRequest"
+    },
+    {
+      "$ref": "#/$defs/requestRequest"
+    },
+    {
+      "$ref": "#/$defs/ackRequest"
+    },
+    {
+      "$ref": "#/$defs/cancelRequest"
+    },
+    {
+      "$ref": "#/$defs/subscribeResponse"
+    },
+    {
+      "$ref": "#/$defs/unsubscribeResponse"
+    },
+    {
+      "$ref": "#/$defs/getHtmlResponse"
+    },
+    {
+      "$ref": "#/$defs/requestResponse"
+    },
+    {
+      "$ref": "#/$defs/ackResponse"
+    },
+    {
+      "$ref": "#/$defs/cancelResponse"
+    },
+    {
+      "$ref": "#/$defs/httpEventNotification"
+    },
+    {
+      "$ref": "#/$defs/surfaceEventNotification"
+    },
+    {
+      "$ref": "#/$defs/ErrorResponse"
+    }
+  ],
+  "$defs": {
+    "Decimal": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-5])$"
+    },
+    "RequestId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+    },
+    "SurfaceRef": {
+      "type": "object",
+      "properties": {
+        "pluginName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "surfaceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "generation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "revision": {
+          "$ref": "#/$defs/Decimal"
+        }
+      },
+      "required": [
+        "pluginName",
+        "surfaceId",
+        "generation",
+        "revision"
+      ],
+      "additionalProperties": false
+    },
+    "Surface": {
+      "type": "object",
+      "properties": {
+        "pluginName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "surfaceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "generation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "revision": {
+          "$ref": "#/$defs/Decimal"
+        },
+        "source": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "plugin_http"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "pluginName",
+        "surfaceId",
+        "generation",
+        "revision",
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "RequestHeader": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "string"
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "ResponseHeader": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "string",
+          "contentEncoding": "base64"
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2,
+      "description": "[name, base64(raw header value bytes)]; repeated names retain their value order."
+    },
+    "subscribeParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "unsubscribeParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "sessionId",
+        "subscriptionId"
+      ],
+      "additionalProperties": false
+    },
+    "getHtmlParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "daemonEpoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "surface": {
+          "$ref": "#/$defs/SurfaceRef"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "subscriptionId",
+        "daemonEpoch",
+        "surface",
+        "requestId"
+      ],
+      "additionalProperties": false
+    },
+    "requestParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "daemonEpoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "surface": {
+          "$ref": "#/$defs/SurfaceRef"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "method": {
+          "enum": [
+            "GET",
+            "HEAD",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "query": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 8192
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RequestHeader"
+          },
+          "maxItems": 64
+        },
+        "bodyBase64": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "contentEncoding": "base64",
+          "maxLength": 1398104
+        }
+      },
+      "required": [
+        "sessionId",
+        "subscriptionId",
+        "daemonEpoch",
+        "surface",
+        "requestId",
+        "method",
+        "path"
+      ],
+      "additionalProperties": false
+    },
+    "cancelParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "subscriptionId",
+        "requestId"
+      ],
+      "additionalProperties": false
+    },
+    "ackParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "throughSequence": {
+          "$ref": "#/$defs/Decimal"
+        }
+      },
+      "required": [
+        "sessionId",
+        "subscriptionId",
+        "requestId",
+        "throughSequence"
+      ],
+      "additionalProperties": false
+    },
+    "subscribeResult": {
+      "type": "object",
+      "properties": {
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "daemonEpoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "sequence": {
+          "const": "0"
+        },
+        "surfaces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Surface"
+          }
+        }
+      },
+      "required": [
+        "subscriptionId",
+        "daemonEpoch",
+        "sequence",
+        "surfaces"
+      ],
+      "additionalProperties": false
+    },
+    "acceptedResult": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "observedSurface": {
+          "$ref": "#/$defs/Surface"
+        },
+        "generationAtomicDispatch": {
+          "const": false
+        },
+        "bodyRevisionVerified": {
+          "const": false
+        }
+      },
+      "required": [
+        "requestId",
+        "observedSurface",
+        "generationAtomicDispatch",
+        "bodyRevisionVerified"
+      ],
+      "additionalProperties": false
+    },
+    "emptyResult": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "StreamResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "const": "complete"
+            }
+          },
+          "required": [
+            "outcome"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "const": "cancelled"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "reason"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "const": "error"
+            },
+            "code": {
+              "const": "transport_error"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "code",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "HttpEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "headers"
+            },
+            "status": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 999
+            },
+            "headers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ResponseHeader"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "status",
+            "headers"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "body"
+            },
+            "bodyBase64": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 21848,
+              "contentEncoding": "base64"
+            }
+          },
+          "required": [
+            "kind",
+            "bodyBase64"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "end"
+            },
+            "result": {
+              "$ref": "#/$defs/StreamResult"
+            }
+          },
+          "required": [
+            "kind",
+            "result"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SurfaceEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "upsert"
+            },
+            "surface": {
+              "$ref": "#/$defs/Surface"
+            }
+          },
+          "required": [
+            "kind",
+            "surface"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "removed"
+            },
+            "surface": {
+              "$ref": "#/$defs/Surface"
+            }
+          },
+          "required": [
+            "kind",
+            "surface"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "reset"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "surfaces": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/Surface"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "surfaces"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "httpEventParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "daemonEpoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "surface": {
+          "$ref": "#/$defs/SurfaceRef"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "sequence": {
+          "$ref": "#/$defs/Decimal"
+        },
+        "event": {
+          "$ref": "#/$defs/HttpEvent"
+        }
+      },
+      "required": [
+        "sessionId",
+        "subscriptionId",
+        "daemonEpoch",
+        "surface",
+        "requestId",
+        "sequence",
+        "event"
+      ],
+      "additionalProperties": false
+    },
+    "surfaceEventParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "daemonEpoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "sequence": {
+          "$ref": "#/$defs/Decimal"
+        },
+        "event": {
+          "$ref": "#/$defs/SurfaceEvent"
+        }
+      },
+      "required": [
+        "sessionId",
+        "subscriptionId",
+        "daemonEpoch",
+        "sequence",
+        "event"
+      ],
+      "additionalProperties": false
+    },
+    "subscribeRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "method": {
+          "const": "_io.github.koalabuttz/polytoken-surfaces/subscribe"
+        },
+        "params": {
+          "$ref": "#/$defs/subscribeParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "unsubscribeRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "method": {
+          "const": "_io.github.koalabuttz/polytoken-surfaces/unsubscribe"
+        },
+        "params": {
+          "$ref": "#/$defs/unsubscribeParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "getHtmlRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "method": {
+          "const": "_io.github.koalabuttz/polytoken-surfaces/getHtml"
+        },
+        "params": {
+          "$ref": "#/$defs/getHtmlParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "requestRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "method": {
+          "const": "_io.github.koalabuttz/polytoken-surfaces/request"
+        },
+        "params": {
+          "$ref": "#/$defs/requestParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "ackRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "method": {
+          "const": "_io.github.koalabuttz/polytoken-surfaces/ack"
+        },
+        "params": {
+          "$ref": "#/$defs/ackParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "cancelRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "method": {
+          "const": "_io.github.koalabuttz/polytoken-surfaces/cancel"
+        },
+        "params": {
+          "$ref": "#/$defs/cancelParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "httpEventNotification": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "_io.github.koalabuttz/polytoken-surfaces/httpEvent"
+        },
+        "params": {
+          "$ref": "#/$defs/httpEventParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "surfaceEventNotification": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "_io.github.koalabuttz/polytoken-surfaces/surfaceEvent"
+        },
+        "params": {
+          "$ref": "#/$defs/surfaceEventParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "subscribeResponse": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "result": {
+          "$ref": "#/$defs/subscribeResult"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "unsubscribeResponse": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "result": {
+          "$ref": "#/$defs/emptyResult"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "getHtmlResponse": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "result": {
+          "$ref": "#/$defs/acceptedResult"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "requestResponse": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "result": {
+          "$ref": "#/$defs/acceptedResult"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "ackResponse": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "result": {
+          "$ref": "#/$defs/emptyResult"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "cancelResponse": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "result": {
+          "$ref": "#/$defs/emptyResult"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "integer"
+            },
+            "message": {
+              "type": "string"
+            },
+            "data": {}
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "error"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

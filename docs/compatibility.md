@@ -1,10 +1,18 @@
 # Polytoken compatibility audit
 
+## Plugin-surface extension update
+
+The optional [plugin-surface extension](surfaces.md) supports ACP v1 and v2 with explicit version negotiation, owning-session discovery, reset/reconnect notifications, HTML retrieval, and cancellable plugin-local HTTP/SSE streams. The [machine-readable schemas](surfaces.schema.json) and [example exchanges](surfaces.examples.json) specify the T3-side contract. Credentials stay in the shim; nonparticipating clients retain existing behavior.
+
+Current validation passes **186 unit tests and two non-ignored integration/smoke tests**, with formatting and strict Clippy checks. Eight account-dependent Rust tests remain ignored. The schema-validated mock-daemon surface exercises pass in both wire versions, covering header/query/binary preservation, HTTP status handling, bounded delivery and acknowledgement timeout, individual cancellation, stale-generation rejection, removals, reconnect/reset, and owner-close cleanup. The isolated installed **0.9.8** daemon passes empty-catalog discovery and subscription cleanup in both versions. The ordinary-session v1/v2, native elicitation, v2 lifecycle, and native worker-session regression exercises also pass.
+
+No plugin was built, installed, or approved: the environment lacks the plugin build tools reported by `polytoken plugin-dev doctor`. Real loaded-plugin callbacks/reload behavior and T3/Paseo rendering remain unverified. Generation-atomic dispatch, body-revision verification, and HTTP stream replay are explicitly advertised as unsupported. These limits are part of the contract, not claims of complete client integration.
+
 ## Native worker-session update
 
 The native subagent-session implementation was subsequently validated against the installed WSL **0.9.8** daemon, SDK **5.3.0**, and schema **1.18.0**. See the [compatibility report](subagent-sessions.md) for supported child activity, cancellation, permission attribution, replay, daemon limits, and unverified client behavior.
 
-Current Rust validation passes **179 unit tests and two non-ignored integration/smoke tests**, with formatting and strict Clippy checks; eight account-dependent tests remain ignored. The isolated real-daemon worker exercises cover native v1, native v2, v1 fallback, and cancellation of waited descendants. The four existing ordinary-session compatibility exercises also pass. All model responses come from local fixtures; T3 Code and Paseo UI behavior remains unverified.
+At the worker-session update, Rust validation passed **179 unit tests and two non-ignored integration/smoke tests**, with formatting and strict Clippy checks; eight account-dependent tests remained ignored. The isolated real-daemon worker exercises cover native v1, native v2, v1 fallback, and cancellation of waited descendants. The four existing ordinary-session compatibility exercises also passed. All model responses come from local fixtures; T3 Code and Paseo UI behavior remains unverified.
 
 ## Original daemon migration audit
 
@@ -104,6 +112,6 @@ The Rust suite was run on Windows; the real-daemon tests were run in Ubuntu WSL 
 
 The initial compatibility commit retained legacy event/history behavior. The subsequent migration uses the versioned client protocol. ACP v2 now observes sessions persistently, resynchronizes entity upserts after gaps/rewrites, and recovers an unavailable owned daemon without resubmitting work. A healthy daemon is not killed because a projection failed. Unknown terminal outcomes remain explicit errors. V1 retains conservative reload-required handling. See [the implementation report](protocol.md) for precise guarantees and limits.
 
-V2 supports native images and preserves embedded resources. Audio remains unsupported; V1 retains image/audio placeholders. Structured question/plan/goal presentation still depends on client elicitation or extension support. Native subagents support the ACP child-session draft; see [worker-session compatibility](subagent-sessions.md). Outpost fleets and plugin surfaces are not advertised. No Paseo, T3 Code, or daemon binary was modified.
+V2 supports native images and preserves embedded resources. Audio remains unsupported; V1 retains image/audio placeholders. Structured question/plan/goal presentation still depends on client elicitation or extension support. Native subagents support the ACP child-session draft; see [worker-session compatibility](subagent-sessions.md). Plugin surfaces require the explicit [surface extension](surfaces.md); Outpost fleets are not advertised. No Paseo, T3 Code, or daemon binary was modified.
 
 Older daemon versions and future releases are not guaranteed. Re-run the contract exports and the real-daemon test after an upgrade. The daemon's reported OpenAPI `info.version` is `0.1.0` even in release 0.9.8; use `polytoken --version` to identify the tested release.

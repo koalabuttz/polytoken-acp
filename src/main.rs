@@ -11,6 +11,7 @@ mod events;
 mod history;
 mod prompt;
 mod store;
+mod surfaces;
 mod sync;
 mod tool_output;
 mod v2;

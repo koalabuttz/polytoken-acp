@@ -13,6 +13,7 @@ struct Frontend {
     initialized: bool,
     initialize_id: Option<String>,
     requests: HashMap<String, String>,
+    surfaces: bool,
 }
 
 fn error(id: Value, code: i64, message: impl ToString) -> Value {
@@ -76,6 +77,14 @@ impl Frontend {
             };
             let requested = msg["params"]["protocolVersion"].as_u64().unwrap_or(1);
             let version = if requested >= 2 { 2 } else { 1 };
+            self.surfaces = crate::surfaces::offered(
+                msg["params"][if version == 2 {
+                    "capabilities"
+                } else {
+                    "clientCapabilities"
+                }]
+                .get("_meta"),
+            );
             if version == 2 {
                 if let Err(e) =
                     serde_json::from_value::<v2::InitializeRequest>(msg["params"].clone())
@@ -84,7 +93,7 @@ impl Frontend {
                 }
                 let params = msg["params"].clone();
                 msg["params"] = json!({"protocolVersion":1,"clientInfo":params["info"],
-                    "clientCapabilities":{"elicitation":params["capabilities"]["elicitation"]},"_meta":params["_meta"]});
+                    "clientCapabilities":{"elicitation":params["capabilities"]["elicitation"],"_meta":params["capabilities"]["_meta"]},"_meta":params["_meta"]});
             }
             self.version = Some(version);
             self.initialize_id = Some(id.to_string());
@@ -96,6 +105,23 @@ impl Frontend {
                 id.map(|id| vec![error(id, -32002, "Initialize the connection first")])
                     .unwrap_or_default(),
             ));
+        }
+        if method.starts_with(crate::surfaces::PREFIX) {
+            let Some(id) = id else {
+                return Ok((vec![], vec![]));
+            };
+            if !self.surfaces || !crate::surfaces::method(&method) {
+                return Ok((
+                    vec![],
+                    vec![error(
+                        id,
+                        -32601,
+                        "Surface extension not negotiated or unknown method",
+                    )],
+                ));
+            }
+            self.requests.insert(id.to_string(), method);
+            return Ok((vec![msg], vec![]));
         }
         if self.version == Some(1) {
             return Ok((vec![msg], vec![]));
@@ -212,10 +238,16 @@ impl Frontend {
             self.initialized = true;
             if self.version == Some(2) {
                 let value = json!({"protocolVersion":2,"info":msg["result"]["agentInfo"],
-                    "capabilities":{"session":{"prompt":{"embeddedContext":{},"image":{}},"mcp":{"http":{}},"delete":{}}},"authMethods":[]});
+                    "capabilities":{"_meta":{(crate::surfaces::CAPABILITY):crate::surfaces::capability()},"session":{"prompt":{"embeddedContext":{},"image":{}},"mcp":{"http":{}},"delete":{}}},"authMethods":[]});
                 let typed: v2::InitializeResponse = serde_json::from_value(value)?;
                 msg["result"] = serde_json::to_value(typed)?;
             }
+        } else if self
+            .requests
+            .get(&key)
+            .is_some_and(|m| m.starts_with(crate::surfaces::PREFIX))
+        {
+            self.requests.remove(&key);
         } else if self.version == Some(2)
             && let Some(method) = self.requests.remove(&key)
             && msg.get("result").is_some()
@@ -312,6 +344,59 @@ mod tests {
             version: Some(2),
             initialized: true,
             ..Default::default()
+        }
+    }
+    #[test]
+    fn surfaces_require_explicit_matching_opt_in_on_both_wire_versions() {
+        for version in [1, 2] {
+            for offer in [
+                json!(null),
+                json!({"versions":[2]}),
+                json!({"versions":[1]}),
+            ] {
+                let mut front = Frontend::default();
+                let caps = json!({"_meta":{(crate::surfaces::CAPABILITY):offer}});
+                let params = if version == 2 {
+                    json!({"protocolVersion":2,"info":{"name":"test","version":"1"},"capabilities":caps})
+                } else {
+                    json!({"protocolVersion":1,"clientCapabilities":caps})
+                };
+                let (requests, _) = front
+                    .incoming(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":params}))
+                    .unwrap();
+                assert_eq!(
+                    requests[0]["params"]["clientCapabilities"]["_meta"]
+                        [crate::surfaces::CAPABILITY],
+                    offer
+                );
+                let init=front.outgoing(json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"test","version":"1"},"agentCapabilities":{"_meta":{(crate::surfaces::CAPABILITY):crate::surfaces::capability()}}}})).unwrap();
+                assert_eq!(
+                    init[0]["result"][if version == 2 {
+                        "capabilities"
+                    } else {
+                        "agentCapabilities"
+                    }]["_meta"][crate::surfaces::CAPABILITY]["version"],
+                    1
+                );
+                let method = format!("{}subscribe", crate::surfaces::PREFIX);
+                let (request, error) = front
+                    .incoming(
+                        json!({"jsonrpc":"2.0","id":2,"method":method,"params":{"sessionId":"s"}}),
+                    )
+                    .unwrap();
+                if offer == json!({"versions":[1]}) {
+                    assert_eq!(request[0]["method"], method);
+                    assert!(error.is_empty());
+                    let result = front
+                        .outgoing(json!({"jsonrpc":"2.0","id":2,"result":{}}))
+                        .unwrap();
+                    assert_eq!(result.len(), 1);
+                    assert!(!front.requests.contains_key("2"));
+                } else {
+                    assert!(request.is_empty());
+                    assert_eq!(error[0]["error"]["code"], -32601);
+                }
+            }
         }
     }
     #[test]
